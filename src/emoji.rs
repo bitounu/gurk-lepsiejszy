@@ -19,3 +19,31 @@ impl regex::Replacer for Replacer {
         }
     }
 }
+
+/// Exact whitespace-delimited tokens only: URL/path fragments and backtick-wrapped tokens stay literal.
+pub(crate) fn ascii_emoticon_replacements(
+    text: &str,
+) -> Vec<(std::ops::Range<usize>, &'static str)> {
+    let mut offset = 0;
+    text.split_inclusive(char::is_whitespace)
+        .filter_map(|part| {
+            let start = offset;
+            offset += part.len();
+            let token = part.trim_end_matches(char::is_whitespace);
+            let emoji = match token {
+                ":)" | ":-)" => "🙂",
+                ";)" | ";-)" => "😉",
+                ":D" | ":-D" => "😃",
+                ":P" | ":p" | ":-P" | ":-p" => "😛",
+                ":(" | ":-(" => "🙁",
+                ":/" | ":-/" => "😕",
+                ":|" | ":-|" => "😐",
+                ":O" | ":o" | ":-O" | ":-o" => "😮",
+                ":'(" | ":'-(" => "😢",
+                "<3" => "❤️",
+                _ => return None,
+            };
+            Some((start..start + token.len(), emoji))
+        })
+        .collect()
+}

@@ -1,5 +1,7 @@
-use itertools::Itertools;
+use unicode_segmentation::UnicodeSegmentation;
+#[cfg(test)]
 use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Cursor {
@@ -52,16 +54,16 @@ impl Cursor {
         }
     }
 
+    fn refresh_position(&mut self, text: &str) {
+        let prefix = &text[..self.idx];
+        self.line = prefix.bytes().filter(|&b| b == b'\n').count();
+        self.col = prefix.rsplit('\n').next().unwrap_or_default().width();
+    }
+
     pub fn put(&mut self, c: char, text: &mut String) {
         text.insert(self.idx, c);
-        if c == '\n' {
-            self.line += 1;
-            self.col = 0;
-            self.idx += 1;
-        } else {
-            self.col += c.width().unwrap_or(0);
-            self.idx += c.len_utf8();
-        }
+        self.idx += c.len_utf8();
+        self.refresh_position(text);
         self.col_wanted = None;
     }
 
@@ -70,68 +72,48 @@ impl Cursor {
     }
 
     pub fn move_left(&mut self, text: &str) {
-        let mut char_indices = text[..self.idx].char_indices();
-        if let Some((idx, c)) = char_indices.next_back() {
-            if c == '\n' {
-                self.line -= 1;
-                self.col = char_indices
-                    .rev()
-                    .take_while(|&(_, c)| c != '\n')
-                    .map(|(_, c)| c.width().unwrap_or(0))
-                    .sum();
-            } else {
-                self.col -= c.width().unwrap_or(0);
-            }
+        if let Some((idx, _)) = text[..self.idx].char_indices().next_back() {
             self.idx = idx;
+            self.refresh_position(text);
             self.col_wanted = None;
         }
     }
 
     pub fn move_right(&mut self, text: &str) {
-        let mut char_indices = text[self.idx..]
-            .char_indices()
-            .map(|(idx, c)| (idx + self.idx, c));
-        if let Some((_idx, c)) = char_indices.next() {
-            if c == '\n' {
-                self.line += 1;
-                self.col = 0;
-            } else {
-                self.col += c.width().unwrap_or(0);
-            }
-            self.idx = char_indices
-                .next()
-                .map(|(idx, _c)| idx)
-                .unwrap_or_else(|| text.len());
+        if let Some(c) = text[self.idx..].chars().next() {
+            self.idx += c.len_utf8();
+            self.refresh_position(text);
             self.col_wanted = None;
         }
     }
 
     pub fn delete_backward(&mut self, text: &mut String) {
-        let mut char_indices = text[..self.idx].char_indices();
-        if let Some((idx, c)) = char_indices.next_back() {
-            if c == '\n' {
-                self.line -= 1;
-                self.col = char_indices
-                    .rev()
-                    .take_while(|&(_, c)| c != '\n')
-                    .map(|(_, c)| c.width().unwrap_or(0))
-                    .sum();
-            } else {
-                self.col -= c.width().unwrap_or(0);
-            }
+        if let Some((idx, _)) = text[..self.idx].char_indices().next_back() {
             self.idx = idx;
             text.remove(idx);
+            self.refresh_position(text);
+            self.col_wanted = None;
         }
     }
 
     pub fn delete_forward(&mut self, text: &mut String) {
         if self.idx < text.len() {
             text.remove(self.idx);
+            self.refresh_position(text);
+            self.col_wanted = None;
         }
     }
 
     pub fn delete_line_backward(&mut self, text: &mut String) {
-        (0..self.col.max(1)).for_each(|_| self.delete_backward(text))
+        let start = text[..self.idx].rfind('\n').map_or(0, |idx| idx + 1);
+        if start == self.idx {
+            self.delete_backward(text);
+        } else {
+            text.replace_range(start..self.idx, "");
+            self.idx = start;
+            self.refresh_position(text);
+            self.col_wanted = None;
+        }
     }
 
     pub fn delete_word_backward(&mut self, text: &mut String) {
@@ -141,88 +123,26 @@ impl Cursor {
     }
 
     pub fn move_line_down(&mut self, text: &str) {
-        let offset = self.idx;
-        let mut char_indices = text[offset..]
-            .char_indices()
-            .map(|(idx, c)| (idx + offset, c))
-            .skip_while(|&(_, c)| c != '\n')
-            .map(|(idx, _)| idx);
-        let end_line = char_indices.next();
-        if let Some(start) = char_indices.next() {
-            self.line += 1;
-            let prev_col = *self.col_wanted.get_or_insert(self.col);
-
-            let end = text[start..]
-                .char_indices()
-                .find(|&(_, c)| c == '\n')
-                .map(|(idx, _)| start + idx)
-                .unwrap_or_else(|| text.len());
-
-            let (idx, col) = text[start..end]
-                .char_indices()
-                .take(prev_col + 1)
-                .scan(0, |prev_width, (idx, c)| {
-                    let col = *prev_width;
-                    *prev_width += c.width().unwrap_or(0);
-                    Some((start + idx, col))
-                })
-                .last()
-                .unwrap_or((start, 0));
-
-            self.col = col;
-            self.idx = idx;
-        } else if let Some(idx) = end_line {
-            self.col = text[..idx]
-                .chars()
-                .rev()
-                .take_while(|&c| c != '\n')
-                .map(|c| c.width().unwrap_or(0))
-                .sum();
-            self.idx = idx;
+        if let Some(end) = text[self.idx..].find('\n').map(|n| self.idx + n) {
+            let start = end + 1;
+            let end = text[start..].find('\n').map_or(text.len(), |n| start + n);
+            let wanted = *self.col_wanted.get_or_insert(self.col);
+            self.idx = start + column_index(&text[start..end], wanted);
         } else {
-            self.col = text
-                .chars()
-                .rev()
-                .take_while(|&c| c != '\n')
-                .map(|c| c.width().unwrap_or(0))
-                .sum();
             self.idx = text.len();
         }
+        self.refresh_position(text);
     }
 
     pub fn move_line_up(&mut self, text: &str) {
-        if let Some((end, _)) = text[..self.idx]
-            .char_indices()
-            .rev()
-            .find(|&(_, c)| c == '\n')
-        {
-            self.line -= 1;
-            let prev_col = *self.col_wanted.get_or_insert(self.col);
-
-            let start = text[..end]
-                .char_indices()
-                .rev()
-                .find(|&(_, c)| c == '\n')
-                .map(|(idx, _)| idx + 1)
-                .unwrap_or(0);
-
-            let (idx, col) = text[start..end]
-                .char_indices()
-                .take(prev_col + 1)
-                .scan(0, |prev_width, (idx, c)| {
-                    let col = *prev_width;
-                    *prev_width += c.width().unwrap_or(0);
-                    Some((start + idx, col))
-                })
-                .last()
-                .unwrap_or((start, 0));
-
-            self.col = col;
-            self.idx = idx;
+        if let Some(end) = text[..self.idx].rfind('\n') {
+            let start = text[..end].rfind('\n').map_or(0, |n| n + 1);
+            let wanted = *self.col_wanted.get_or_insert(self.col);
+            self.idx = start + column_index(&text[start..end], wanted);
         } else {
-            self.col = 0;
             self.idx = 0;
         }
+        self.refresh_position(text);
     }
 
     pub fn move_word_left(&mut self, text: &str) {
@@ -266,46 +186,17 @@ impl Cursor {
     }
 
     pub fn start_of_line(&mut self, text: &str) {
-        if let Some((idx, col, c)) = text[..self.idx]
-            .char_indices()
-            .rev()
-            .scan(0, |prev_width, (idx, c)| {
-                let col = *prev_width;
-                *prev_width += c.width().unwrap_or(0);
-                Some((idx, col, c))
-            })
-            .find(|&(_, _, c)| c == '\n')
-        {
-            self.idx = idx;
-            self.col -= col;
-            self.line -= 1;
-            if c == '\n' {
-                self.move_right(text);
-            }
-        } else {
-            self.idx = 0;
-            self.col = 0;
-        }
+        self.idx = text[..self.idx].rfind('\n').map_or(0, |n| n + 1);
+        self.refresh_position(text);
+        self.col_wanted = None;
     }
 
     pub fn end_of_line(&mut self, text: &str) {
-        let offset = self.idx;
-        if let Some((idx, col, c)) = text[self.idx..]
-            .char_indices()
-            .scan(0, |prev_width, (idx, c)| {
-                let col = *prev_width;
-                *prev_width += c.width().unwrap_or(0);
-                Some((offset + idx, col, c))
-            })
-            .find_or_last(|&(_, _, c)| c == '\n')
-        {
-            self.idx = idx;
-            self.col += col;
-            if c != '\n' {
-                // end of text
-                self.move_right(text);
-            }
-        }
+        self.idx = text[self.idx..]
+            .find('\n')
+            .map_or(text.len(), |n| self.idx + n);
+        self.refresh_position(text);
+        self.col_wanted = None;
     }
 
     pub fn delete_suffix(&mut self, text: &mut String) {
@@ -320,6 +211,19 @@ impl Cursor {
             text.replace_range(self.idx..end, "");
         }
     }
+}
+
+/// Byte boundary at the requested display column, without splitting a grapheme.
+fn column_index(line: &str, wanted: usize) -> usize {
+    let mut col = 0;
+    for (idx, grapheme) in line.grapheme_indices(true) {
+        let next = col + grapheme.width();
+        if next > wanted {
+            return idx;
+        }
+        col = next;
+    }
+    line.len()
 }
 
 /// Snap the byte index `idx` to a char boundary in `s`.
@@ -343,19 +247,11 @@ fn snap_to_char(s: &str, mut idx: usize) -> usize {
 
 #[cfg(test)]
 fn calc_line_column(s: &str, idx: usize) -> (usize, usize) {
-    let mut col = 0;
-    let mut line = 0;
-
-    for c in s[0..idx].chars().rev() {
-        if c == '\n' {
-            line += 1;
-        }
-        if line == 0 {
-            col += 1;
-        }
-    }
-
-    (line, col)
+    let prefix = &s[..idx];
+    (
+        prefix.bytes().filter(|&b| b == b'\n').count(),
+        prefix.rsplit('\n').next().unwrap_or_default().width(),
+    )
 }
 
 #[cfg(test)]
@@ -577,5 +473,35 @@ mod tests {
         }
 
         true
+    }
+}
+
+#[cfg(test)]
+mod emoji_column_tests {
+    use super::*;
+    #[test]
+    fn vertical_motion_keeps_display_column_across_variation_selectors() {
+        let text = "❤️x\nab\n❤️x";
+        let mut cursor = Cursor::begin();
+        cursor.move_right(text);
+        cursor.move_right(text);
+        assert_eq!(cursor.col, 2);
+        cursor.move_line_down(text);
+        assert_eq!(
+            (cursor.idx, cursor.line, cursor.col),
+            ("❤️x\nab".len(), 1, 2)
+        );
+        cursor.move_line_down(text);
+        assert_eq!(
+            (cursor.idx, cursor.line, cursor.col),
+            ("❤️x\nab\n❤️".len(), 2, 2)
+        );
+        cursor.move_line_up(text);
+        assert_eq!(
+            (cursor.idx, cursor.line, cursor.col),
+            ("❤️x\nab".len(), 1, 2)
+        );
+        cursor.move_line_up(text);
+        assert_eq!((cursor.idx, cursor.line, cursor.col), ("❤️".len(), 0, 2));
     }
 }
