@@ -34,15 +34,19 @@ lto = "thin"
 debug = true
 
 [features]
-dev = ["prost", "base64", "serde_json"]
+dev = ["prost"]
 
 [dependencies]
+shell-words = "1.1"
+crc32fast = "1.4"
+spellbook = "=0.4.2"
+encoding_rs = "0.8"
 presage = { git = "https://github.com/whisperfish/presage", rev = "94b3978f5456469cfd4d9f72351a5eff93715f81", default-features = false }
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "94b3978f5456469cfd4d9f72351a5eff93715f81", default-features = false }
 
 # dev feature dependenciestoml
 prost = { version = "0.14.4", optional = true }
-base64 = { version = "0.22.1", optional = true }
+base64 = "0.22.1"
 
 aho-corasick = "1.1.3"
 anyhow = "1.0.94"
@@ -56,7 +60,7 @@ emojis = "0.9.0"
 futures-channel = "0.3.31"
 hex = "0.4.3"
 hostname = "0.4.0"
-image = { version = "0.25.5", default-features = false, features = ["png"] }
+image = { version = "0.25.5", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 itertools = "0.15.0"
 libsqlite3-sys = { version = "0.36.0", features = [
     "bundled-sqlcipher-custom-crypto",
@@ -68,10 +72,11 @@ opener = "0.8.2"
 phonenumber = "0.3.6"
 postcard = { version = "1.1.1", features = ["alloc"] }
 ratatui = "0.30.0"
+ratatui-image = { version = "=11.1.0", default-features = false, features = ["crossterm"] }
 regex = "1.11.1"
 scopeguard = "1.2.0"
 serde = { version = "1.0.216", features = ["derive"] }
-serde_json = { version = "1.0.134", optional = true }
+serde_json = "1.0.134"
 sqlx = { version = "0.9.0", features = [
     "sqlite",
     "runtime-tokio",
@@ -85,6 +90,9 @@ tokio = { version = "1.42.0", default-features = false, features = [
     "macros",
     "net",
     "time",
+    "fs",
+    "io-util",
+    "sync",
 ] }
 tokio-stream = "0.1.17"
 toml = "1.1.3"
@@ -92,6 +100,7 @@ tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 unicode-width = "0.2.0"
+unicode-segmentation = "=1.13.3"
 uuid = { version = "1.11", features = ["v4"] }
 url = "2.5.4"
 tempfile = "3.14.0"
@@ -104,6 +113,24 @@ strip-ansi-escapes = "0.2.1"
 dialoguer = "0.12.0"
 zeroize = { version = "1.8.1", features = ["derive", "serde"] }
 edit = "0.1.5"
+
+# Signal Secure Backup reader, credentials and forward-secrecy recovery.
+libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1", features = ["test-util", "json"] }
+libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
+libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
+libsignal-net = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
+libsignal-net-infra = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
+zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+futures = "0.3"
+protobuf = "=3.7.2"
+http = "1"
+libc = "0.2"
+libsignal-svrb = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
+rand = "0.9"
+aes = "0.9"
+cbc = "0.2"
+hmac = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.2.0"
@@ -135,3 +162,14 @@ required-features = ["dev"]
 # - Disable atexit cleanup in sqlcipher, which unsafe when other threads may
 #   still be closing database connections.
 libsqlite3-sys = { version = "0.36.0", git = "https://github.com/boxdot/rusqlite", rev = 'a2f393913d9994645c94810498bef07b2183b3dc' }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "=0.13.13", default-features = false, features = ["tokio", "screenshot"] }
+
+# Signal requires the encrypted upload length when requesting attachment forms.
+# Upstream fix: whisperfish/libsignal-service-rs#501; pin for reproducible builds.
+[patch."https://github.com/whisperfish/libsignal-service-rs"]
+libsignal-service = { path = "vendor/libsignal-service" }
+
+[patch."https://github.com/whisperfish/presage"]
+presage = { path = "vendor/presage" }
