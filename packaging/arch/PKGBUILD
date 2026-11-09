@@ -1,0 +1,27 @@
+# Local test package: build from the checkout containing this PKGBUILD.
+pkgname=gurk-local-aliases
+pkgver=0.10.2.aliases24
+pkgrel=1
+pkgdesc='Signal terminal client with local aliases, persistent drafts and staged attachments'
+arch=('x86_64')
+url='https://github.com/boxdot/gurk-rs'
+license=('AGPL-3.0-only')
+depends=('glibc>=2.39' 'libgcc' 'libstdc++')
+makedepends=('cargo>=1.94' 'protobuf' 'clang' 'cmake' 'pkgconf' 'git')
+optdepends=('hunspell-pl: Polish offline spelling dictionary' 'hunspell-en_us: English offline spelling dictionary' 'xdg-utils: open links and attachments' 'sxiv: optional external image viewer' 'ttf-nerd-fonts-symbols-mono: file type icons' 'xdg-desktop-portal: interactive screenshot capture' 'grim: Wayland screenshot fallback' 'maim: interactive X11 screenshot fallback' 'scrot: alternative X11 screenshot fallback')
+provides=('gurk=0.10.2')
+conflicts=('gurk' 'gurk-git' 'gurk-bin')
+options=('!debug' '!lto')
+
+build() {
+    cd "$startdir/../.."
+    # SQLx query metadata is checked into the repository; no user database is used.
+    SQLX_OFFLINE=true cargo build --release --locked --bin gurk --target-dir "$PWD/target"
+}
+
+package() {
+    cd "$startdir/../.."
+    install -Dm755 target/release/gurk "$pkgdir/usr/bin/gurk"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 LICENSE-AGPL-3.0 "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
