@@ -1,0 +1,60 @@
+
+name: Build Arch package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-arch:
+    name: Arch Linux x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    container:
+      image: archlinux:base-devel
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel \
+            git \
+            cargo \
+            protobuf \
+            clang \
+            cmake \
+            pkgconf
+
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Prepare build user
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Build package
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          runuser -u builder -- bash -c '
+            set -e
+            cd packaging/arch
+            makepkg --noconfirm
+          '
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: gurk-arch-x86_64
+          path: packaging/arch/*.pkg.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
