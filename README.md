@@ -40,6 +40,9 @@ library code retain their respective authorship and licenses.
 
 ## About this version
 
+The screenshots below are redacted copies; some are cropped to the relevant
+controls. Example contact names replace private names.
+
 Gurk links to an existing Signal account and provides conversations, groups,
 replies, reactions and attachments in a terminal. This version adds local
 aliases, persistent drafts, file selection, image galleries, search, offline
@@ -49,6 +52,10 @@ Existing configuration files remain readable. Database migrations run
 on startup. Some visible additions are opt-in: inline image previews, the shortcut
 bar and ASCII emoticon replacement are disabled by default. See
 [configuration defaults](#defaults).
+
+![Gurk conversation layout with an inline attachment thumbnail](docs/images/interface.png)
+
+*Conversation layout and inline image preview. Private names and conversation text have been removed.*
 
 ## Install and build
 
@@ -124,6 +131,10 @@ notifications. Conversation aliases take precedence in conversation lists;
 person aliases remain full-length even with `first_name_only = true`. Removing
 an alias reveals the current synchronized name. Editing preserves the draft.
 
+![Local conversation alias editor](docs/images/local-alias.png)
+
+*Local alias editor with an anonymous example name. Enter saves; Esc cancels.*
+
 ### Drafts
 
 Text, cursor position, staged file paths, editing context and the active
@@ -169,6 +180,10 @@ their order and have unique timestamps; delivery is not atomic across parts.
 Preparation/upload failures are reported. A local preview alone is not proof
 that a recipient received the file.
 
+![File picker with seven of ten available selection slots used](docs/images/attachment-multiselect.png)
+
+*File picker with 7 files marked out of a maximum of 10, modification dates and human-readable sizes. The home path is anonymized.*
+
 ### Image previews
 
 Enable `show_image_previews = true` for inline thumbnails fitted to the
@@ -182,6 +197,10 @@ Decoding runs in bounded background workers with a thumbnail cache. Limits are
 considered for previews at once. Unsupported, missing or oversized files remain
 accessible through their attachment labels. Labels show filenames by default;
 `show_attachment_paths = true` reveals full file URLs.
+
+![Selected message containing two image attachments and their thumbnails](docs/images/attachment-gallery-selection.png)
+
+*A selected message contains two image attachments. Alt+P opens the attachment gallery; private message text is removed.*
 
 ### Attachment gallery
 
@@ -210,6 +229,27 @@ over the terminal, then restores it. The editor receives a private, read-only
 copy, up to 100 MiB; the original is unchanged. Copies and editor sidecars are
 removed after exit. Missing files and recognized but invalid images show a
 closable error rather than opening an editor.
+
+![First image in the internal attachment gallery](docs/images/attachment-gallery-first.png)
+
+*First attachment, shown at 100% in the Kitty renderer. Identifying details in the photograph are covered.*
+
+![Second image in the internal attachment gallery](docs/images/attachment-gallery-second.png)
+
+*Right switches to the second attachment; Left returns to the first. The vehicle registration is covered.*
+
+<details>
+<summary>Zoom and panning examples</summary>
+
+![Zoomed image panned to the upper left](docs/images/image-pan-top-left.png)
+
+*Second attachment at 381%, panned toward the upper left with Alt+arrows.*
+
+![Zoomed image panned to the lower right](docs/images/image-pan-bottom-right.png)
+
+*The same attachment and zoom, panned toward the lower right. +/- changes zoom; Esc returns to the conversation.*
+
+</details>
 
 ### Hidden conversations
 
@@ -256,6 +296,10 @@ timestamps or image previews. To copy older history, navigate there first and
 reopen selection. Clipboard errors keep the view open. No OSC52 fallback is
 provided. Terminal Shift+mouse selection and link handling remain available.
 
+![Conversation search controls with a highlighted result](docs/images/conversation-search.png)
+
+*Literal search for CCD, showing result 6 of 7. Up/Down changes the result; Enter keeps its position. Sender labels are removed.*
+
 ### Editing sent messages
 
 Select your own message with PgUp/PgDown, then press **e** or **Ctrl+E** with an
@@ -284,6 +328,10 @@ They survive saved drafts, edits and attachment captions. Editing characters
 inside a confirmed name makes it plain text; pasted/typed `@name` is not bound
 automatically. Ambiguous compound external-editor changes may also remove the
 binding. Mention notifications depend on recipients, membership and settings.
+
+![Contact completion popup with anonymous example names](docs/images/contact-mentions.png)
+
+*Contact completion for @a. Anonymous names replace the original contacts; Tab or Enter inserts the selected mention.*
 
 ### ASCII emoticons
 
@@ -324,6 +372,14 @@ emails, numeric tokens and backtick-delimited code are skipped. This is spelling
 not grammar; checks cover the first 32 KiB of a draft. Suggestions load on demand.
 Missing dictionaries are reported in the Input title. Configure persistent
 exceptions and dictionary locations in `[spellcheck]`; restart after changes.
+
+![Polish spelling suggestions and underlined draft words](docs/images/spelling-polish.png)
+
+*Local Polish spelling suggestions: gararz can be replaced with garaż. The draft shows underlined suspect words.*
+
+![English spelling suggestions and underlined draft words](docs/images/spelling-english.png)
+
+*Local English spelling suggestions: knwo can be replaced with know. Enter applies a suggestion without sending the message.*
 
 ### Image metadata cleaning
 
@@ -378,6 +434,10 @@ activity behavior.
 F1 is the in-app reference. **F4** shows context-sensitive hints, including dialog
 and gallery controls. Its initial visibility and contrast/dark/custom colors are
 configured under `[shortcut_bar]`.
+
+![Contextual shortcut bar at the bottom of the terminal](docs/images/shortcut-bar.png)
+
+*F4 toggles the contextual shortcut bar. This crop shows the conversation controls.*
 
 ### Conversation and composer
 
