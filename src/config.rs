@@ -17,6 +17,18 @@ const SIGNAL_DB_NAME: &str = "signal.sqlite";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
+    /// Convert standalone ASCII emoticons in the composer, opt-in for old configs.
+    #[serde(default)]
+    pub auto_ascii_emoticons: bool,
+    /// Offline dictionary spelling checks; message text never leaves this process.
+    #[serde(default)]
+    pub spellcheck: SpellcheckConfig,
+    /// Strip descriptive JPEG/PNG metadata before uploading attachments.
+    #[serde(default = "default_true")]
+    pub clean_image_metadata: bool,
+    /// Display messages by sender timestamp or stable local receipt order.
+    #[serde(default)]
+    pub message_order: MessageOrder,
     /// Directory to store messages and signal database, and attachments.
     #[serde(
         default = "default_data_dir",
@@ -33,6 +45,27 @@ pub struct Config {
     /// Whether only to show the first name of a contact
     #[serde(default)]
     pub first_name_only: bool,
+    /// Show inline image attachment previews (Unicode half blocks).
+    #[serde(default)]
+    pub show_image_previews: bool,
+    /// Show full attachment file URLs instead of filenames in messages.
+    #[serde(default)]
+    pub show_attachment_paths: bool,
+    /// Fullscreen and external image viewer settings.
+    #[serde(default)]
+    pub image_viewer: ImageViewerConfig,
+    /// Optional context-sensitive shortcut row at the bottom of the terminal.
+    #[serde(default)]
+    pub shortcut_bar: ShortcutBarConfig,
+    /// File type glyphs require a Nerd Font; false uses text labels instead.
+    #[serde(default = "default_true")]
+    pub nerd_font_icons: bool,
+    /// Screenshot directory, defaulting to ~/Pictures if present, otherwise HOME.
+    #[serde(default)]
+    pub screenshot_dir: Option<PathBuf>,
+    /// Optional screenshot program and arguments; output path is appended as one argument.
+    #[serde(default)]
+    pub screenshot_command: Vec<String>,
     /// Whether to show receipts (sent, delivered, read) information next to your user name in UI
     #[serde(default = "default_true")]
     pub show_receipts: bool,
@@ -60,6 +93,113 @@ pub struct Config {
     /// Whether to enable the default keybindings
     #[serde(default = "default_true")]
     pub default_keybindings: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpellcheckConfig {
+    pub enabled: bool,
+    pub languages: Vec<String>,
+    pub dictionary_dirs: Vec<PathBuf>,
+    pub ignored_words: Vec<String>,
+}
+
+impl Default for SpellcheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            languages: vec!["pl_PL".into(), "en_US".into()],
+            dictionary_dirs: Vec::new(),
+            ignored_words: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageOrder {
+    /// Preserve the historical sender timestamp ordering.
+    #[default]
+    Sent,
+    /// Display new messages in the order first stored locally.
+    Received,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortcutBarTheme {
+    #[default]
+    Contrast,
+    Dark,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShortcutBarConfig {
+    pub enabled: bool,
+    pub theme: ShortcutBarTheme,
+    #[serde(
+        deserialize_with = "deserialize_shortcut_color",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub foreground: Option<String>,
+    #[serde(
+        deserialize_with = "deserialize_shortcut_color",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub background: Option<String>,
+}
+
+fn deserialize_shortcut_color<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let color = Option::<String>::deserialize(deserializer)?;
+    if color.as_ref().is_some_and(|color| {
+        color.len() != 7
+            || !color.starts_with('#')
+            || !color.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+    }) {
+        return Err(de::Error::custom("shortcut bar color must be #RRGGBB"));
+    }
+    Ok(color)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageViewerMode {
+    #[default]
+    Internal,
+    External,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageViewerProtocol {
+    #[default]
+    Auto,
+    Halfblocks,
+    Kitty,
+    Sixel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImageViewerConfig {
+    pub mode: ImageViewerMode,
+    /// Program and arguments; the image path is appended without a shell.
+    pub command: Vec<String>,
+    pub protocol: ImageViewerProtocol,
+}
+
+impl Default for ImageViewerConfig {
+    fn default() -> Self {
+        Self {
+            mode: ImageViewerMode::Internal,
+            command: vec!["sxiv".into(), "-a".into()],
+            protocol: ImageViewerProtocol::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,10 +333,21 @@ impl Config {
     /// Create new config with default paths from the given user.
     pub fn with_user(user: User) -> Self {
         Config {
+            auto_ascii_emoticons: false,
+            message_order: MessageOrder::default(),
             user,
+            spellcheck: SpellcheckConfig::default(),
+            clean_image_metadata: true,
             data_dir: default_data_dir(),
             deprecated_signal_db_path: default_signal_db_path(),
             first_name_only: false,
+            show_image_previews: false,
+            show_attachment_paths: false,
+            image_viewer: ImageViewerConfig::default(),
+            shortcut_bar: ShortcutBarConfig::default(),
+            nerd_font_icons: true,
+            screenshot_dir: None,
+            screenshot_command: Vec::new(),
             show_receipts: true,
             notifications: NotificationConfig::default(),
             bell: true,
@@ -447,6 +598,65 @@ mod tests {
     }
 
     #[test]
+    fn message_order_defaults_and_explicit_modes() {
+        let legacy: Config = toml::from_str("[user]\nname = \"Legacy\"\n").unwrap();
+        assert_eq!(legacy.message_order, MessageOrder::Sent);
+        assert_eq!(
+            Config::with_user(legacy.user).message_order,
+            MessageOrder::Sent
+        );
+        for (value, expected) in [
+            ("sent", MessageOrder::Sent),
+            ("received", MessageOrder::Received),
+        ] {
+            let text = format!("message_order = {value:?}\n[user]\nname = \"Test\"\n");
+            let config: Config = toml::from_str(&text).unwrap();
+            assert_eq!(config.message_order, expected);
+            assert_eq!(
+                toml::from_str::<Config>(&toml::to_string(&config).unwrap()).unwrap(),
+                config
+            );
+        }
+        assert!(
+            toml::from_str::<Config>("message_order = \"unknown\"\n[user]\nname = \"Test\"\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn shortcut_bar_defaults_and_colors() {
+        let legacy: Config = toml::from_str("[user]\nname = \"Legacy\"\n").unwrap();
+        assert_eq!(legacy.shortcut_bar, ShortcutBarConfig::default());
+        assert!(!legacy.shortcut_bar.enabled);
+        assert_eq!(legacy.shortcut_bar.theme, ShortcutBarTheme::Contrast);
+        assert_eq!(
+            Config::with_user(legacy.user).shortcut_bar,
+            ShortcutBarConfig::default()
+        );
+        let configured: ShortcutBarConfig = toml::from_str(
+            "enabled = true\ntheme = \"dark\"\nforeground = \"#aBcD01\"\nbackground = \"#000000\"",
+        )
+        .unwrap();
+        assert!(configured.enabled);
+        assert_eq!(configured.theme, ShortcutBarTheme::Dark);
+        assert_eq!(configured.foreground.as_deref(), Some("#aBcD01"));
+        assert_eq!(
+            toml::from_str::<ShortcutBarConfig>(&toml::to_string(&configured).unwrap()).unwrap(),
+            configured
+        );
+        for color in ["red", "123456", "#12345", "#1234567", "#gg0000", "#é0000"] {
+            for field in ["foreground", "background"] {
+                let source =
+                    format!("[user]\nname = \"Test\"\n[shortcut_bar]\n{field} = {color:?}");
+                assert!(
+                    toml::from_str::<Config>(&source).is_err(),
+                    "{field}: {color}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_save_new_at_non_existent() -> anyhow::Result<()> {
         let dir = tempdir()?;
 
@@ -463,6 +673,80 @@ mod tests {
         assert!(config_path.parent().unwrap().exists()); // data path parent is created
 
         Ok(())
+    }
+
+    #[test]
+    fn composer_options_accept_old_configs_and_custom_screenshot_paths() {
+        let old: Config = toml::from_str("[user]\nname = \"Old\"\n").unwrap();
+        assert!(old.screenshot_dir.is_none());
+        assert!(old.screenshot_command.is_empty());
+        let configured: Config = toml::from_str("screenshot_dir = \"~/Shots\"\nnerd_font_icons = false\nscreenshot_command = [\"maim\", \"-s\"]\n[user]\ndisplay_name = \"Test\"\n").unwrap();
+        assert_eq!(
+            configured.screenshot_dir.as_deref(),
+            Some(Path::new("~/Shots"))
+        );
+        assert!(!configured.nerd_font_icons);
+        assert_eq!(configured.screenshot_command, ["maim", "-s"]);
+    }
+
+    #[test]
+    fn image_viewer_legacy_defaults_and_explicit_configuration() {
+        let legacy: Config = toml::from_str("[user]\nname = \"Legacy\"\n").unwrap();
+        assert_eq!(legacy.image_viewer.mode, ImageViewerMode::Internal);
+        assert_eq!(legacy.image_viewer.protocol, ImageViewerProtocol::Auto);
+        let explicit: Config = toml::from_str(
+            r#"
+[user]
+display_name = "Test"
+[image_viewer]
+mode = "external"
+command = ["sxiv", "-a"]
+protocol = "halfblocks"
+"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.image_viewer.mode, ImageViewerMode::External);
+        assert_eq!(explicit.image_viewer.command, ["sxiv", "-a"]);
+        assert_eq!(
+            explicit.image_viewer.protocol,
+            ImageViewerProtocol::Halfblocks
+        );
+        let serialized = toml::to_string(&explicit).unwrap();
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), explicit);
+    }
+
+    #[test]
+    fn ascii_emoticons_config_is_opt_in_and_roundtrips() {
+        let old: Config = toml::from_str("[user]\ndisplay_name = 'Test'\n").unwrap();
+        assert!(!old.auto_ascii_emoticons);
+        assert!(!Config::with_user(old.user.clone()).auto_ascii_emoticons);
+        let enabled: Config =
+            toml::from_str("auto_ascii_emoticons = true\n[user]\ndisplay_name = 'Test'\n").unwrap();
+        assert!(enabled.auto_ascii_emoticons);
+        let text = toml::to_string(&enabled).unwrap();
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), enabled);
+    }
+
+    #[test]
+    fn image_previews_are_opt_in_and_old_config_loads() {
+        let legacy: Config = toml::from_str("[user]\nname = \"Legacy\"\n").unwrap();
+        assert!(!legacy.show_image_previews);
+        let enabled: Config =
+            toml::from_str("show_image_previews = true\n[user]\ndisplay_name = \"Test\"\n")
+                .unwrap();
+        assert!(enabled.show_image_previews);
+    }
+
+    #[test]
+    fn attachment_paths_are_opt_in() {
+        let legacy: Config = toml::from_str("[user]\nname = \"Legacy\"\n").unwrap();
+        assert!(!legacy.show_attachment_paths);
+        assert!(!Config::with_user(legacy.user.clone()).show_attachment_paths);
+        let enabled: Config =
+            toml::from_str("show_attachment_paths = true\n[user]\nname = \"Test\"\n").unwrap();
+        assert!(enabled.show_attachment_paths);
+        let serialized = toml::to_string(&enabled).unwrap();
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), enabled);
     }
 
     #[test]

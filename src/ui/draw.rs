@@ -15,6 +15,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     widgets::Wrap,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
@@ -23,15 +24,49 @@ use crate::channels::SelectChannel;
 use crate::command::{Command, WindowMode};
 use crate::cursor::Cursor;
 use crate::data::{AssociatedValue, Message};
-use crate::receipt::{Receipt, ReceiptEvent};
+use crate::receipt::Receipt;
 use crate::storage::MessageId;
 use crate::util::utc_timestamp_msec_to_local;
 
 use super::CHANNEL_VIEW_RATIO;
+use super::image_preview::{PreviewCache, render_preview};
 use super::name_resolver::NameResolver;
 
 /// The main function drawing the UI for each frame
 pub fn draw(f: &mut Frame, app: &mut App) {
+    app.refresh_mentions();
+    app.refresh_spelling();
+    let full = f.area();
+    let show_bar = app.shortcut_bar_visible && full.height > 1;
+    let area = Rect {
+        height: full.height.saturating_sub(u16::from(show_bar)),
+        ..full
+    };
+    let shortcuts = if show_bar {
+        super::shortcut_bar::items(app)
+    } else {
+        Vec::new()
+    };
+    draw_content(f, app, area);
+    if show_bar {
+        super::shortcut_bar::draw(
+            f,
+            Rect::new(full.x, full.bottom() - 1, full.width, 1),
+            &app.config.shortcut_bar,
+            &shortcuts,
+        );
+    }
+}
+
+fn draw_content(f: &mut Frame, app: &mut App, area: Rect) {
+    if let Some(selection) = app.text_selection.as_mut() {
+        selection.draw(f, area);
+        return;
+    }
+    if app.image_viewer.is_some() {
+        super::image_viewer::draw(f, app, area);
+        return;
+    }
     if app.is_help() {
         // Display shortcut panel
         let chunks = Layout::default()
@@ -41,27 +76,24 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Constraint::Percentage(5),
             ])
             .direction(Direction::Horizontal)
-            .split(f.area());
+            .split(area);
         draw_help(f, app, chunks[1]);
         return;
     }
 
     let chunks = if app.is_channel_list_shown() {
         Layout::default()
-            .constraints(
-                [
-                    Constraint::Ratio(1, CHANNEL_VIEW_RATIO),
-                    Constraint::Ratio(3, CHANNEL_VIEW_RATIO),
-                ]
-                .as_ref(),
-            )
+            .constraints([
+                Constraint::Ratio(1, CHANNEL_VIEW_RATIO),
+                Constraint::Ratio(3, CHANNEL_VIEW_RATIO),
+            ])
             .direction(Direction::Horizontal)
-            .split(f.area())
+            .split(area)
     } else {
         Layout::default()
-            .constraints([Constraint::Percentage(100)].as_ref())
+            .constraints([Constraint::Percentage(100)])
             .direction(Direction::Horizontal)
-            .split(f.area())
+            .split(area)
     };
 
     if app.is_channel_list_shown() {
@@ -71,15 +103,140 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_chat(f, app, chunks[0]);
     }
 
+    if app.spelling_dialog.is_some() {
+        draw_spelling_dialog(f, app, area);
+    }
     if app.select_channel.is_shown {
-        draw_select_channel_popup(f, &mut app.select_channel);
+        draw_select_channel_popup(f, &mut app.select_channel, area);
+    }
+    if let Some(editor) = app.alias_editor.as_ref() {
+        draw_alias_editor(f, editor, area);
+    }
+    if app.forward_dialog.is_some() {
+        draw_forward_dialog(f, app, area);
+    }
+    if app.hidden_dialog.is_some() {
+        draw_hidden_dialog(f, app, area);
+    }
+    if let Some(picker) = app.file_picker.as_mut() {
+        picker.draw(f, app.config.nerd_font_icons, area);
     }
 }
 
-fn draw_select_channel_popup(f: &mut Frame, select_channel: &mut SelectChannel) {
-    let area = centered_rect(60, 60, f.area());
+fn draw_forward_dialog(f: &mut Frame, app: &App, area: Rect) {
+    let Some(dialog) = app.forward_dialog.as_ref() else {
+        return;
+    };
+    let area = centered_rect(85, 70, area);
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title("Forward message — choose recipient")
+        .title_bottom("Up/Down: select | Enter: send | Esc: cancel");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).split(inner);
+    if dialog.entries.is_empty() {
+        f.render_widget(Paragraph::new("No other visible conversations"), rows[0]);
+    } else {
+        let mut state = ListState::default();
+        state.select(Some(dialog.selected));
+        f.render_stateful_widget(
+            List::new(
+                dialog
+                    .entries
+                    .iter()
+                    .map(|(_, name)| ListItem::new(super::file_picker::terminal_text(name))),
+            )
+            .highlight_style(Style::default().reversed()),
+            rows[0],
+            &mut state,
+        );
+    }
+    let status = dialog.error.as_deref().unwrap_or(if dialog.preparing {
+        "Preparing attachments — Esc cancels"
+    } else {
+        "Sends text/files without source attribution. Enter confirms sending."
+    });
+    f.render_widget(
+        Paragraph::new(super::file_picker::terminal_text(status)).wrap(Wrap { trim: false }),
+        rows[1],
+    );
+}
+
+fn draw_hidden_dialog(f: &mut Frame, app: &App, area: Rect) {
+    let Some(dialog) = app.hidden_dialog.as_ref() else {
+        return;
+    };
+    let area = centered_rect(85, 70, area);
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title("Hidden conversations")
+        .title_bottom("Up/Down: select | Enter: restore | Esc: close");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let regions = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    if dialog.entries.is_empty() {
+        f.render_widget(Paragraph::new("No hidden conversations"), regions[0]);
+    } else {
+        let rows = dialog
+            .entries
+            .iter()
+            .map(|(_, name)| ListItem::new(super::file_picker::terminal_text(name)));
+        let mut state = ListState::default();
+        state.select(Some(dialog.selected));
+        f.render_stateful_widget(
+            List::new(rows).highlight_style(Style::default().reversed()),
+            regions[0],
+            &mut state,
+        );
+    }
+    if let Some(error) = dialog.error.as_ref() {
+        f.render_widget(
+            Paragraph::new(super::file_picker::terminal_text(error))
+                .style(Style::default().fg(Color::Red)),
+            regions[1],
+        );
+    }
+}
+
+fn draw_alias_editor(f: &mut Frame, editor: &crate::app::aliases::AliasEditor, area: Rect) {
+    let area = centered_rect(85, 55, area);
+    f.render_widget(Clear, area);
+    let title = match editor.target {
+        crate::storage::AliasTarget::Person(_) => "Local person alias",
+        crate::storage::AliasTarget::Channel(_) => "Local channel alias",
+    };
+    let block = Block::bordered()
+        .title(title)
+        .title_bottom("Enter: save | Esc: cancel | Empty: remove");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    let cursor_col = editor.input.cursor.col;
+    let scroll = cursor_col.saturating_sub(inner.width.saturating_sub(1) as usize);
+    f.render_widget(
+        Paragraph::new(editor.input.data.as_str())
+            .scroll((0, scroll.min(u16::MAX as usize) as u16)),
+        chunks[0],
+    );
+    if let Some(error) = editor.error.as_ref() {
+        f.render_widget(
+            Paragraph::new(error.as_str())
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: true }),
+            chunks[1],
+        );
+    }
+    f.set_cursor_position((inner.x + (cursor_col - scroll) as u16, inner.y));
+}
+
+fn draw_select_channel_popup(f: &mut Frame, select_channel: &mut SelectChannel, area: Rect) {
+    let area = centered_rect(60, 60, area);
     let chunks = Layout::default()
-        .constraints([Constraint::Length(1 + 2), Constraint::Min(0)].as_ref())
+        .constraints([Constraint::Length(1 + 2), Constraint::Min(0)])
         .direction(Direction::Vertical)
         .split(area);
     f.render_widget(Clear, area);
@@ -127,12 +284,16 @@ fn draw_channels(f: &mut Frame, app: &mut App, area: Rect) {
         let label = if label_width <= channel_list_width || suffix.is_empty() {
             label
         } else {
-            let diff = label_width - channel_list_width;
-            let mut end = channel.name.width().saturating_sub(diff);
-            while !channel.name.is_char_boundary(end) {
-                end += 1;
-            }
-            format!("{}{}", &channel.name[0..end], suffix)
+            let available = channel_list_width.saturating_sub(suffix.width());
+            let mut width = 0;
+            let clipped: String = channel_name
+                .chars()
+                .take_while(|c| {
+                    width += c.width().unwrap_or(0);
+                    width <= available
+                })
+                .collect();
+            format!("{clipped}{suffix}")
         };
         ListItem::new(label)
     });
@@ -200,23 +361,137 @@ fn wrap(text: &str, mut cursor: Cursor, width: usize) -> (String, Cursor, usize)
     (res, cursor, line + 1)
 }
 
+// Wrapped text differs only by inserted newlines; keep byte ranges in original coordinates.
+fn spelling_text(
+    wrapped: &str,
+    original: &str,
+    errors: &[crate::spellcheck::Misspelling],
+    mentions: &[crate::mentions::DraftMention],
+) -> Text<'static> {
+    let mut offset = 0;
+    let mut lines = vec![Line::default()];
+    for c in wrapped.chars() {
+        let inserted = c == '\n' && !original[offset..].starts_with('\n');
+        if c == '\n' {
+            lines.push(Line::default());
+        } else {
+            let index = errors.partition_point(|error| error.range.end <= offset);
+            let wrong = errors
+                .get(index)
+                .is_some_and(|error| error.range.contains(&offset));
+            let confirmed = mentions.iter().any(|m| m.start <= offset && offset < m.end);
+            let style = if confirmed {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if wrong {
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::UNDERLINED)
+            } else {
+                Style::default()
+            };
+            let spans = &mut lines.last_mut().expect("line exists").spans;
+            if let Some(last) = spans.last_mut().filter(|last| last.style == style) {
+                last.content.to_mut().push(c);
+            } else {
+                spans.push(Span::styled(c.to_string(), style));
+            }
+        }
+        if !inserted {
+            offset += c.len_utf8();
+        }
+    }
+    Text::from(lines)
+}
+
+fn draw_spelling_dialog(f: &mut Frame, app: &App, area: Rect) {
+    let Some(dialog) = app.spelling_dialog.as_ref() else {
+        return;
+    };
+    let width = area.width.min(64);
+    let height = area.height.min(14);
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let mut lines = vec![Line::from(format!("Word: {}", dialog.word))];
+    if let Some(status) = app.spelling.status() {
+        lines.push(Line::from(status.to_owned()));
+    } else if dialog.range.is_none() {
+        lines.push(Line::from("Checking… No misspelling found yet."));
+    } else if app.spelling.suggestions().is_empty() {
+        lines.push(Line::from("Loading suggestions, or none available."));
+    }
+    for (index, suggestion) in app.spelling.suggestions().iter().enumerate() {
+        lines.push(Line::styled(
+            format!(
+                "{} {suggestion}",
+                if index == dialog.selected { ">" } else { " " }
+            ),
+            if index == dialog.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            },
+        ));
+    }
+    lines.push(Line::from(
+        "↑/↓ choose · Enter correct · i ignore · Esc close",
+    ));
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Spelling")),
+        rect,
+    );
+}
+
 fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
-    let text_width = area.width.saturating_sub(2) as usize;
+    let search_height = if app.message_search.is_some() {
+        area.height.min(4)
+    } else {
+        0
+    };
+    let search_area = Rect::new(
+        area.x,
+        area.bottom().saturating_sub(search_height),
+        area.width,
+        search_height,
+    );
+    let area = Rect {
+        height: area.height.saturating_sub(search_height),
+        ..area
+    };
+    let text_width = area.width.saturating_sub(2).max(1) as usize;
     let (wrapped_input, cursor, num_input_lines) =
         wrap(&app.input.data, app.input.cursor.clone(), text_width);
 
+    let has_status = !app.pending_attachments.is_empty()
+        || app.composer_error.is_some()
+        || app.screenshot_in_progress
+        || app.send_job.is_some();
+    let attachment_height = if !has_status {
+        0
+    } else if app.pending_attachments.is_empty() {
+        3
+    } else {
+        9
+    };
     let chunks = Layout::default()
-        .constraints(
-            [
-                Constraint::Min(0),
-                Constraint::Length(num_input_lines as u16 + 2),
-            ]
-            .as_ref(),
-        )
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(attachment_height),
+            Constraint::Length(num_input_lines.min(u16::MAX as usize - 2) as u16 + 2),
+        ])
         .direction(Direction::Vertical)
         .split(area);
-
     draw_messages(f, app, chunks[0]);
+    super::mentions::draw(f, app, chunks[0]);
+    if has_status {
+        draw_pending_attachments(f, app, chunks[1]);
+    }
 
     let title = match (app.is_editing(), app.is_multiline_input) {
         (true, true) => "Input (Editing, Multiline)",
@@ -225,46 +500,138 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
         (false, false) => "Input",
     };
 
-    let input = Paragraph::new(Text::from(wrapped_input))
-        .block(Block::default().borders(Borders::ALL).title(title));
-    f.render_widget(input, chunks[1]);
-    if !app.select_channel.is_shown {
+    let title = app
+        .spelling
+        .status()
+        .map(|status| format!("{title} · {status}"))
+        .unwrap_or_else(|| title.to_owned());
+    let input = Paragraph::new(spelling_text(
+        &wrapped_input,
+        &app.input.data,
+        app.spelling.errors(),
+        &app.input.mentions,
+    ))
+    .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(input, chunks[2]);
+    if !app.select_channel.is_shown
+        && app.spelling_dialog.is_none()
+        && app.file_picker.is_none()
+        && app.message_search.is_none()
+        && chunks[2].width > 2
+        && chunks[2].height > 2
+    {
         f.set_cursor_position((
-            chunks[1].x + cursor.col as u16 + 1,  // +1 for frame
-            chunks[1].y + cursor.line as u16 + 1, // +1 for frame
+            chunks[2].x + cursor.col as u16 + 1,  // +1 for frame
+            chunks[2].y + cursor.line as u16 + 1, // +1 for frame
         ));
     }
+    draw_message_search(f, app, search_area);
 }
 
-// TODO: This does IO and needs to be moved into App
-fn prepare_receipts(app: &mut App) {
-    let user_id = app.user_id;
-    let Some(window) = app.window.as_ref() else {
+fn draw_message_search(f: &mut Frame, app: &App, area: Rect) {
+    let Some(search) = app.message_search.as_ref() else {
         return;
     };
-    let channel_id = window.channel_id();
-    let viewport_bottom = app
-        .positions
-        .get(&channel_id)
-        .and_then(|pos| pos.viewport_bottom);
-
-    // viewport_bottom and everything older that's loaded
-    let read_messages: Vec<Message> = window
-        .iter_rev_from(viewport_bottom)
-        .filter(|msg| matches!(msg.receipt, Receipt::Delivered) && msg.from_id != user_id)
-        .map(|msg| {
-            let mut msg = msg.clone();
-            msg.receipt = Receipt::Read;
-            msg
-        })
-        .collect();
-
-    for message in read_messages {
-        let from_id = message.from_id;
-        let arrived_at = message.arrived_at;
-        app.store_message(channel_id, message);
-        app.add_receipt_event(ReceiptEvent::new(from_id, arrived_at, Receipt::Read));
+    let count = search.current.map_or_else(
+        || format!("0/{}", search.hits.len()),
+        |index| format!("{}/{}", index + 1, search.hits.len()),
+    );
+    let block = Block::bordered().title(format!(
+        "Search {count} · Up/Down F3/Shift+F3 · Enter accept · Esc cancel"
+    ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
     }
+    let col = search.input.cursor.col;
+    let scroll = col.saturating_sub(inner.width.saturating_sub(1) as usize);
+    f.render_widget(
+        Paragraph::new(search.input.data.as_str())
+            .scroll((0, scroll.min(u16::MAX as usize) as u16)),
+        Rect { height: 1, ..inner },
+    );
+    if inner.height > 1 {
+        f.render_widget(
+            Paragraph::new(
+                search
+                    .error
+                    .as_deref()
+                    .unwrap_or("Literal search · Enter keeps this result"),
+            ),
+            Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1),
+        );
+    }
+    f.set_cursor_position((
+        inner.x
+            + col
+                .saturating_sub(scroll)
+                .min(inner.width.saturating_sub(1) as usize) as u16,
+        inner.y,
+    ));
+}
+
+fn draw_pending_attachments(f: &mut Frame, app: &App, area: Rect) {
+    use super::file_picker::{file_icon, human_size, terminal_text};
+    let title = if app.send_job.is_some() {
+        "Preparing attachments — Esc: cancel"
+    } else if app.composer_error.is_some() && app.pending_attachments.is_empty() {
+        "Notice — Esc: dismiss"
+    } else if app.composer_error.is_some() {
+        "Attachments — Esc: dismiss notice | Enter: retry | Alt+A: add"
+    } else {
+        "Attachments — Enter: send | Esc: remove | Alt+A: add"
+    };
+    let block = Block::bordered().title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let mut lines = Vec::new();
+    if let Some(error) = app.composer_error.as_ref() {
+        lines.push(Line::styled(
+            terminal_text(error),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    if app.screenshot_in_progress {
+        lines.push(Line::raw("Capturing screenshot..."));
+    }
+    app.image_previews
+        .request_visible(app.pending_attachments.iter().map(|path| path.as_path()));
+    for path in app.pending_attachments.iter().take(3) {
+        let size = std::fs::metadata(path)
+            .map(|metadata| human_size(metadata.len()))
+            .unwrap_or_else(|_| "missing".into());
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy();
+        lines.push(Line::raw(format!(
+            "{} {} ({size})",
+            file_icon(path, false, app.config.nerd_font_icons),
+            terminal_text(&name)
+        )));
+    }
+    if app.pending_attachments.len() > 3 {
+        lines.push(Line::raw(format!(
+            "... and {} more",
+            app.pending_attachments.len() - 3
+        )));
+    }
+    if let Some(image) = app
+        .pending_attachments
+        .iter()
+        .find_map(|path| app.image_previews.cached(path))
+    {
+        lines.extend(render_preview(
+            &image,
+            inner.width as usize,
+            (inner.height as usize).saturating_sub(lines.len()),
+        ));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
@@ -274,10 +641,12 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
     if height == 0 || width == 0 {
         return;
     }
+    let title = app
+        .selected_channel_id()
+        .and_then(|id| app.channel(id))
+        .map(|channel| format!("Messages — {}", app.channel_name(channel)))
+        .unwrap_or_else(|| "Messages".to_owned());
     app.message_view_height = height;
-
-    // to be removed because we don't want any IO in the rendering pass
-    prepare_receipts(app);
 
     let Some(window) = app.window.as_ref() else {
         // No channel selected
@@ -285,7 +654,7 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new("No Channel selected")
                 .block(
                     Block::bordered()
-                        .title("Messages")
+                        .title(title.clone())
                         .padding(Padding::top(area.height / 2)),
                 )
                 .centered(),
@@ -300,7 +669,7 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new("No messages")
                 .block(
                     Block::bordered()
-                        .title("Messages")
+                        .title(title.clone())
                         .padding(Padding::top(area.height / 2)),
                 )
                 .centered(),
@@ -321,7 +690,15 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
         .viewport_bottom
         .unwrap_or_else(|| window.newest().expect("logic error: no messages"));
     if let Some(selected) = pos.selected
-        && bottom < selected
+        && (
+            app.storage
+                .message_sort_key(MessageId::new(window.channel_id(), bottom)),
+            bottom,
+        ) < (
+            app.storage
+                .message_sort_key(MessageId::new(window.channel_id(), selected)),
+            selected,
+        )
     {
         // selected is newer than bottom => pull it to the bottom edge
         bottom = selected;
@@ -332,9 +709,25 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
     let selected_pos = selected.and_then(|s| ats.iter().position(|&at| at == s));
     let (start, end) = fit_window(&heights, height, selected_pos);
 
+    // Only visible messages start decoder jobs. Measuring older candidates may use cached
+    // thumbnails, but must not decode the entire history or churn the bounded cache.
+    if app.config.show_image_previews {
+        app.image_previews.request_visible(
+            ats[start..end]
+                .iter()
+                .filter_map(|arrived_at| window.get(*arrived_at))
+                .filter(|message| !message.deleted)
+                .flat_map(|message| {
+                    message
+                        .attachments
+                        .iter()
+                        .map(|attachment| attachment.filename.as_path())
+                }),
+        );
+    }
     let visible = items[start..end].to_vec();
     let list = List::new(visible)
-        .block(Block::default().title("Messages").borders(Borders::ALL))
+        .block(Block::default().title(title.clone()).borders(Borders::ALL))
         .highlight_style(Style::default().reversed())
         .direction(ListDirection::BottomToTop);
     let mut state = ListState::default();
@@ -346,6 +739,21 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
     let at_tail = window.at_newest() && window.newest() == Some(new_bottom);
     let channel_id = window.channel_id();
     app.positions.entry(channel_id).or_default().viewport_bottom = (!at_tail).then_some(new_bottom);
+    if app.terminal_focused
+        && app.file_picker.is_none()
+        && app.message_search.is_none()
+        && app.forward_dialog.is_none()
+        && app.hidden_dialog.is_none()
+        && app.alias_editor.is_none()
+        && !app.select_channel.is_shown
+    {
+        app.mark_visible_reads(
+            ats[start..end]
+                .iter()
+                .map(|timestamp| MessageId::new(channel_id, *timestamp))
+                .collect(),
+        );
+    }
 }
 
 fn build_candidates(
@@ -369,7 +777,7 @@ fn build_candidates(
     let mut candidates: Vec<&Message> = Vec::new();
     let mut seen_until = until.is_none();
     for message in window.iter_rev_from(Some(bottom)) {
-        if Some(message.arrived_at) == until {
+        if Some(message.storage_id()) == until {
             seen_until = true;
         }
         candidates.push(message);
@@ -383,7 +791,7 @@ fn build_candidates(
         app,
         candidates
             .iter()
-            .map(|message| MessageId::new(channel_id, message.arrived_at)),
+            .map(|message| MessageId::new(channel_id, message.storage_id())),
     );
 
     // message display options
@@ -417,20 +825,40 @@ fn build_candidates(
             });
         let show_receipt = ShowReceipt::from_msg(msg, app.user_id, app.config.show_receipts);
 
-        if let Some(item) = display_message(
-            &names,
-            msg,
-            &prefix,
-            width,
-            height,
-            show_receipt,
-            date_division,
-            new_messages_division,
-            app.config.colored_messages,
-        ) {
+        let focus = app
+            .search_focus
+            .as_ref()
+            .filter(|focus| focus.channel_id == channel_id && focus.local_id == msg.storage_id());
+        let focused_item = focus.and_then(|focus| {
+            display_search_message(
+                &names,
+                msg,
+                &prefix,
+                width,
+                height,
+                show_receipt_for_focus(msg, app),
+                focus,
+            )
+        });
+        if let Some(item) = focused_item.or_else(|| {
+            display_message(
+                &names,
+                msg,
+                &prefix,
+                width,
+                height,
+                show_receipt,
+                date_division,
+                new_messages_division,
+                app.config.colored_messages,
+                app.config
+                    .show_image_previews
+                    .then_some(&app.image_previews),
+            )
+        }) {
             let h = item.height();
             items.push(item);
-            items_ats.push(msg.arrived_at);
+            items_ats.push(msg.storage_id());
             heights.push(h);
         }
     }
@@ -516,6 +944,168 @@ fn display_receipt(receipt: Receipt, show: ShowReceipt) -> &'static str {
     }
 }
 
+// Search uses normalized body offsets, before author/quote/attachment decorations.
+fn show_receipt_for_focus(msg: &Message, app: &App) -> ShowReceipt {
+    ShowReceipt::from_msg(msg, app.user_id, app.config.show_receipts)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn display_search_message(
+    names: &NameResolver,
+    msg: &Message,
+    prefix: &str,
+    width: usize,
+    height: usize,
+    show_receipt: ShowReceipt,
+    focus: &crate::app::search::SearchFocus,
+) -> Option<ListItem<'static>> {
+    if width == 0 || height == 0 || msg.deleted {
+        return None;
+    }
+    let body = crate::search::normalize_body(msg.message.as_deref().unwrap_or_default());
+    let regex = crate::search::literal_regex(&focus.query).ok().flatten()?;
+    let ranges: Vec<_> = regex.find_iter(&body).map(|m| m.range()).collect();
+    // Revalidate after a live edit; stored offsets are only hints for the same occurrence.
+    let active_range = match ranges.get(focus.occurrence) {
+        Some(range) if *range == focus.range => &focus.range,
+        Some(range) => range,
+        None => return None,
+    };
+    let (name, color) = names.resolve(msg.from_id);
+    let mut first_prefix = vec![
+        Span::styled(
+            display_receipt(msg.receipt, show_receipt),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(
+            display_time(msg.arrived_at),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(name.into_owned(), Style::default().fg(color)),
+        Span::raw(": "),
+    ];
+    if first_prefix.iter().map(Span::width).sum::<usize>() >= width {
+        first_prefix.clear();
+    }
+    let continuation = if prefix.width() < width { prefix } else { "" };
+    // Display replacements carry their original source range. Search continues
+    // to use literal normalized body text rather than resolved mention names.
+    let mut tokens: Vec<(String, Option<std::ops::Range<usize>>, Style)> = Vec::new();
+    let quote_style = Style::default().fg(Color::Rgb(150, 150, 150));
+    if let Some(quote) = msg
+        .quote
+        .as_ref()
+        .and_then(|quote| displayed_quote(names, quote))
+    {
+        tokens.push((format!("> {quote}\n"), None, quote_style));
+    }
+    let mut mentions = msg
+        .body_ranges
+        .iter()
+        .filter_map(|range| match range.value {
+            AssociatedValue::MentionUuid(id) => Some(id),
+            AssociatedValue::Style(_) => None,
+        });
+    for (offset, grapheme) in body.grapheme_indices(true) {
+        let source = offset..offset + grapheme.len();
+        let display = if grapheme == "￼" {
+            mentions
+                .next()
+                .map(|id| format!("@{}", names.resolve(id).0))
+                .unwrap_or_else(|| grapheme.to_owned())
+        } else {
+            grapheme.to_owned()
+        };
+        tokens.push((display, Some(source), Style::default()));
+    }
+    // Keep all normal body decorations, with no searchable offsets.
+    let mut decorated = body.clone();
+    add_attachments(
+        msg,
+        &mut decorated,
+        names.file_icon_setting(),
+        names.show_attachment_paths(),
+    );
+    add_reactions(msg, &mut decorated);
+    add_edited(msg, &mut decorated);
+    add_expire_countdown(msg, &mut decorated);
+    tokens.push((decorated[body.len()..].to_owned(), None, Style::default()));
+    if let Some(reason) = msg.send_failed.as_deref() {
+        tokens.push((
+            format!("\n[Could not send: {reason}]"),
+            None,
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let mut lines = vec![Line::from(first_prefix.clone())];
+    let mut used = lines[0].width();
+    let mut active_line = 0;
+    let mut found_active = false;
+    for (display, source, base_style) in tokens {
+        let overlaps = |range: &std::ops::Range<usize>| {
+            source
+                .as_ref()
+                .is_some_and(|source| source.start < range.end && range.start < source.end)
+        };
+        let active = overlaps(active_range);
+        let matched = source.as_ref().is_some_and(|source| {
+            let index = ranges.partition_point(|range| range.end <= source.start);
+            ranges
+                .get(index)
+                .is_some_and(|range| range.start < source.end)
+        });
+        let style = if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD)
+        } else if matched {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            base_style
+        };
+        for grapheme in display.graphemes(true) {
+            let cell_width = if grapheme == "\t" {
+                4
+            } else {
+                grapheme.width()
+            };
+            if grapheme == "\n" || (used + cell_width > width && used > 0) {
+                lines.push(Line::from(Span::raw(continuation.to_owned())));
+                used = continuation.width();
+                if grapheme == "\n" {
+                    continue;
+                }
+            }
+            if active && !found_active {
+                active_line = lines.len() - 1;
+                found_active = true;
+            }
+            lines.last_mut().unwrap().spans.push(Span::styled(
+                if grapheme == "\t" {
+                    "    ".to_owned()
+                } else {
+                    grapheme.to_owned()
+                },
+                style,
+            ));
+            used += cell_width;
+        }
+    }
+    if lines.len() > height {
+        let start = active_line
+            .saturating_sub(height / 2)
+            .min(lines.len() - height);
+        lines = lines.into_iter().skip(start).take(height).collect();
+        // Every fragment retains the sender/time header. The body keeps the same
+        // continuation indentation, and the active row stays within the window.
+        if start > 0 && height > 1 && active_line > start {
+            lines[0] = Line::from(first_prefix);
+        }
+    }
+    Some(ListItem::new(Text::from(lines)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn display_message(
     names: &NameResolver,
@@ -527,7 +1117,11 @@ fn display_message(
     date_division: Option<String>,
     unread_messages_division: Option<String>,
     colored_messages: bool,
+    previews: Option<&PreviewCache>,
 ) -> Option<ListItem<'static>> {
+    if height == 0 || width == 0 {
+        return None;
+    }
     let receipt = Span::styled(
         display_receipt(msg.receipt, show_receipt),
         Style::default().fg(Color::Yellow),
@@ -550,7 +1144,12 @@ fn display_message(
     } else {
         let text = strip_ansi_escapes::strip_str(msg.message.as_deref().unwrap_or_default());
         let mut text = replace_mentions(msg, names, text);
-        add_attachments(msg, &mut text);
+        add_attachments(
+            msg,
+            &mut text,
+            names.file_icon_setting(),
+            names.show_attachment_paths(),
+        );
         if text.is_empty() {
             return None; // no text => nothing to render
         }
@@ -648,10 +1247,36 @@ fn display_message(
         );
     }
 
-    if spans.len() > height {
-        // span is too big to be shown fully
-        spans.resize(height - 1, Line::from(""));
+    let images: Vec<_> = if !msg.deleted && width > prefix.width() && height > 1 {
+        previews
+            .into_iter()
+            .flat_map(|cache| {
+                msg.attachments
+                    .iter()
+                    .filter_map(|attachment| cache.cached(&attachment.filename))
+            })
+            .take(height)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let preview_budget = if images.is_empty() {
+        0
+    } else {
+        (height / 2).max(1).min(height - 1).min(12 * images.len())
+    };
+    let text_height = height - preview_budget;
+    if spans.len() > text_height {
+        spans.resize(text_height.saturating_sub(1), Line::from(""));
         spans.push(Line::from(format!("{prefix}[...]")));
+    }
+    for (idx, image) in images.iter().enumerate() {
+        let rows = (height - spans.len()) / (images.len() - idx);
+        let lines = render_preview(image, width - prefix.width(), rows);
+        spans.extend(lines.into_iter().map(|mut line| {
+            line.spans.insert(0, Span::raw(prefix.to_owned()));
+            line
+        }));
     }
     Some(ListItem::new(Text::from(spans)))
 }
@@ -701,15 +1326,36 @@ fn display_date_line(
     }
 }
 
-fn add_attachments(msg: &Message, out: &mut String) {
+fn add_attachments(msg: &Message, out: &mut String, icons: Option<bool>, show_paths: bool) {
     for attachment in &msg.attachments {
         if !out.is_empty() {
             out.push('\n');
         }
+        if let Some(nerd) = icons {
+            out.push_str(super::file_picker::file_icon(
+                &attachment.filename,
+                false,
+                nerd,
+            ));
+            out.push(' ');
+        }
         if attachment.content_type.starts_with("audio/") {
             out.push_str("[Voice Note] ");
         }
-        out.push_str(&format!("<file://{}>", attachment.filename.display()));
+        let label = if show_paths {
+            attachment.filename.as_os_str()
+        } else {
+            attachment
+                .filename
+                .file_name()
+                .unwrap_or_else(|| attachment.filename.as_os_str())
+        };
+        let label = super::file_picker::terminal_text(&label.to_string_lossy());
+        if show_paths {
+            out.push_str(&format!("<file://{label}>"));
+        } else {
+            out.push_str(&label);
+        }
     }
     if msg.attachment_downloads.failed > 0 {
         if !out.is_empty() {
@@ -879,14 +1525,146 @@ fn help_indicators<'a>() -> Vec<Line<'a>> {
     v
 }
 
+fn quick_help(app: &App) -> Vec<Line<'static>> {
+    let keys = |command: Command| {
+        let keys = [
+            WindowMode::Anywhere,
+            WindowMode::Normal,
+            WindowMode::MessageSelected,
+            WindowMode::Multiline,
+        ]
+        .iter()
+        .filter_map(|mode| app.mode_keybindings.get(mode))
+        .flat_map(|bindings| bindings.iter())
+        .filter(|(_, cmd)| **cmd == command)
+        .map(|(key, _)| key.to_string())
+        .sorted()
+        .dedup()
+        .join(", ");
+        if keys.is_empty() {
+            "unbound".to_owned()
+        } else {
+            keys
+        }
+    };
+    vec![
+        Line::raw(format!(
+            "{}: toggle contextual shortcut bar",
+            keys(Command::ToggleShortcutBar)
+        )),
+        Line::raw(format!(
+            "{}: hide/silence current conversation | {}: hidden conversations",
+            keys(Command::HideChannel),
+            keys(Command::ShowHiddenChannels)
+        )),
+        Line::raw("Hidden list: Up/Down select | Enter restore | Esc close"),
+        Line::raw(format!(
+            "{}: forward highlighted message without source attribution",
+            keys(Command::ForwardMessage)
+        )),
+        Line::raw("Forward: Up/Down choose visible recipient | Enter sends | Esc cancels"),
+        Line::raw(format!(
+            "{}: keyboard text selection",
+            keys(Command::SelectText)
+        )),
+        Line::raw(
+            "Copy text: arrows move | Space starts/clears selection | Enter copies | Esc cancels",
+        ),
+        Line::raw(
+            "Copy text: Home/End line bounds | PgUp/PgDown scroll | new messages do not shift selection",
+        ),
+        Line::raw("PgDown on newest message: unselect and stop replying. Esc also unselects."),
+        Line::default(),
+        Line::styled(
+            "Local aliases",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(format!(
+            "{}: edit current channel alias",
+            keys(Command::EditChannelAlias)
+        )),
+        Line::raw(format!(
+            "{}: edit selected author / direct contact alias",
+            keys(Command::EditPersonAlias)
+        )),
+        Line::raw("Enter: save | Esc: cancel | Empty: remove alias"),
+        Line::default(),
+        Line::raw(format!(
+            "{}: search current conversation (/ is literal inside a draft)",
+            keys(Command::SearchMessages)
+        )),
+        Line::raw(format!(
+            "{}: oldest | {}: newest/follow",
+            keys(Command::JumpOldest),
+            keys(Command::JumpNewest)
+        )),
+        Line::raw("Search: Up/Down or F3/Shift+F3 | Enter accepts | Esc cancels"),
+        Line::raw(format!(
+            "Long results show the match; {} opens full text",
+            keys(Command::SelectText)
+        )),
+        Line::default(),
+        Line::styled(
+            "Image viewer",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(format!(
+            "{}: view selected message image",
+            keys(Command::ViewImage)
+        )),
+        Line::raw("Esc / q: return from fullscreen image to conversation"),
+        Line::default(),
+        Line::styled(
+            "Files and screenshots",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(format!(
+            "{}: choose attachment; {}: capture screenshot",
+            keys(Command::AttachFiles),
+            keys(Command::CaptureScreenshot)
+        )),
+        Line::raw("Picker Enter: add only. Chat Enter: send. Esc: remove attachments."),
+        Line::raw("Picker Space: mark/unmark file (up to 10); counter shows marked files."),
+        Line::raw("Picker Up/Down, PgUp/PgDown, Home/End: highlight file."),
+        Line::raw("Picker Left/Backspace: parent; Right/Enter: open directory."),
+        Line::raw("Picker .: hidden files; t: name / modified newest first."),
+        Line::raw("Picker /: type/paste path; ~: home; p: ~/Pictures; s: screenshot directory."),
+        Line::raw("Picker Alt+P: highlighted image fullscreen; Esc/q: return to picker."),
+        Line::raw("Picker Alt+O: highlighted file in default MIME application."),
+        Line::raw("Picker Esc: cancel; path entry Esc: return to file list."),
+        Line::default(),
+    ]
+}
+
 fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
-    let mut command_bindings = help_commands();
-    command_bindings.extend(help_indicators());
-    command_bindings.extend(bindings(app));
-    let command_bindings = Paragraph::new(Text::from(command_bindings))
-        .block(Block::bordered().title("Available commands and configured shortcuts"))
-        .scroll(app.help_scroll);
-    f.render_widget(command_bindings, area);
+    let mut lines = quick_help(app);
+    lines.extend(help_commands());
+    lines.extend(help_indicators());
+    lines.extend(bindings(app));
+    let block = Block::bordered().title("Available commands and configured shortcuts");
+    let inner = block.inner(area);
+    let lines: Vec<_> = lines
+        .into_iter()
+        .flat_map(|line| {
+            let style = line.style;
+            textwrap::wrap(&line.to_string(), inner.width.max(1) as usize)
+                .into_iter()
+                .map(|line| Line::styled(line.into_owned(), style))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    app.help_scroll_max = if inner.width == 0 || inner.height == 0 {
+        0
+    } else {
+        lines
+            .len()
+            .saturating_sub(inner.height as usize)
+            .min(u16::MAX as usize) as u16
+    };
+    let paragraph = Paragraph::new(Text::from(lines));
+    app.help_scroll.0 = app.help_scroll.0.min(app.help_scroll_max);
+    app.help_scroll.1 = 0;
+    f.render_widget(paragraph.block(block).scroll(app.help_scroll), area);
 }
 
 fn displayed_quote(names: &NameResolver, quote: &Message) -> Option<String> {
@@ -898,26 +1676,20 @@ fn displayed_quote(names: &NameResolver, quote: &Message) -> Option<String> {
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Percentage((100 - percent_y) / 2),
-                Constraint::Percentage(percent_y),
-                Constraint::Percentage((100 - percent_y) / 2),
-            ]
-            .as_ref(),
-        )
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
         .split(r);
 
     Layout::default()
         .direction(Direction::Horizontal)
-        .constraints(
-            [
-                Constraint::Percentage((100 - percent_x) / 2),
-                Constraint::Percentage(percent_x),
-                Constraint::Percentage((100 - percent_x) / 2),
-            ]
-            .as_ref(),
-        )
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
         .split(popup_layout[1])[1]
 }
 
@@ -928,12 +1700,317 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_alias_renders_in_narrow_channel_list_and_editor() {
+        use crate::storage::AliasTarget;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+        let (mut app, _, _) = crate::app::tests::test_app().await;
+        let id = app.selected_channel_id().unwrap();
+        app.set_local_alias(
+            AliasTarget::Channel(id),
+            "Żółw 🐢 bardzo długa nazwa rozmowy",
+        )
+        .unwrap();
+        // A narrow pane forces clipping of the displayed Unicode alias with an unread suffix.
+        let mut terminal = Terminal::new(TestBackend::new(48, 18)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("Local channel alias"));
+        assert!(rendered.contains("Enter"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn help_scroll_stops_at_bottom_and_clamps_after_resize() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+        let (mut app, _, _) = crate::app::tests::test_app().await;
+        app.toggle_help();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        for _ in 0..1000 {
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        assert!(app.help_scroll.0 < 250, "scroll escaped help content");
+        let bottom = app.help_scroll.0;
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.help_scroll.0, bottom);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        terminal.backend_mut().resize(100, 300);
+        terminal.autoresize().unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.help_scroll.0, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn help_shows_alias_instructions_near_top_and_mouse_does_not_change_chat() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+        let (mut app, _, _) = crate::app::tests::test_app().await;
+        let channel = app.selected_channel_id();
+        app.toggle_help();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("F2"));
+        assert!(rendered.contains("F3"));
+        assert!(rendered.contains("Empty"));
+        app.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 50,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 100, 20),
+        );
+        assert_eq!(app.help_scroll.0, 1);
+        assert_eq!(app.selected_channel_id(), channel);
+        assert!(
+            app.positions
+                .get(&channel.unwrap())
+                .and_then(|p| p.selected)
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_preview_is_opt_in_fits_chat_after_resize_and_hides_deleted_images() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.data");
+        image::RgbaImage::from_pixel(320, 160, image::Rgba([250, 10, 20, 255]))
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        let (mut app, _, _) = crate::app::tests::test_app().await;
+        let id = app.selected_channel_id().unwrap();
+        let mut message = app.storage.message(MessageId::new(id, 0)).unwrap();
+        message.from_id = id.user().unwrap();
+        message.message = Some("Photo caption ".repeat(50));
+        // MIME and extension intentionally do not claim this is an image.
+        message.attachments = vec![crate::signal::Attachment {
+            id: "photo".into(),
+            content_type: "text/plain".into(),
+            filename: path,
+            size: 0,
+        }];
+        app.store_message(id, message.clone());
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            !terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "▀")
+        );
+        app.config.show_image_previews = true;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                terminal.draw(|f| draw(f, &mut app)).unwrap();
+                if terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .any(|cell| cell.symbol() == "▀")
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("enabled preview never appeared");
+        for (idx, cell) in terminal.backend().buffer().content.iter().enumerate() {
+            if cell.symbol() == "▀" {
+                assert!((21..79).contains(&(idx % 80)));
+                assert!((1..16).contains(&(idx / 80)));
+            }
+        }
+        terminal.backend_mut().resize(40, 12);
+        terminal.autoresize().unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "▀")
+        );
+        message.deleted = true;
+        app.store_message(id, message);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            !terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "▀")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn alias_help_respects_custom_and_disabled_bindings() {
+        let (mut app, _, _) = crate::app::tests::test_app().await;
+        let config = toml::from_str("[normal]\nF8 = \"edit_channel_alias\"\n").unwrap();
+        app.mode_keybindings = crate::command::get_keybindings(&config, false).unwrap();
+        let text = quick_help(&app)
+            .into_iter()
+            .map(|line| line.to_string())
+            .join("\n");
+        assert!(text.contains("F8"));
+        assert!(text.contains("unbound"));
+        assert!(!text.contains("F2"));
+        assert!(!text.contains("F3: edit selected author"));
+        assert!(text.contains("unbound: edit selected author"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn alias_help_does_not_advertise_bindings_limited_to_other_windows() {
+        let (mut app, _, _) = crate::app::tests::test_app().await;
+        let config = toml::from_str("[help]\nF9 = \"edit_channel_alias\"\n").unwrap();
+        app.mode_keybindings = crate::command::get_keybindings(&config, false).unwrap();
+        let text = quick_help(&app)
+            .into_iter()
+            .map(|line| line.to_string())
+            .join("\n");
+        assert!(!text.contains("F9"));
+        assert!(text.contains("unbound"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn help_covers_session_picker_controls_and_aliases() {
+        let (app, _, _) = crate::app::tests::test_app().await;
+        let text = quick_help(&app)
+            .into_iter()
+            .map(|line| line.to_string())
+            .join("\n");
+        for expected in [
+            "F2",
+            "F3",
+            "Space",
+            "Alt+P",
+            "Alt+O",
+            "PgUp",
+            "Home/End",
+            "Backspace",
+            "Picker .",
+            "t:",
+            "~:",
+            "p:",
+            "s:",
+            "capture screenshot",
+            "Esc",
+        ] {
+            assert!(text.contains(expected), "Missing help: {expected}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hidden_shortcuts_and_footer_reserve_bottom_row_and_modal_paste() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let (mut app, _, _) = crate::app::tests::test_app().await;
+        app.input.put_char('x');
+        app.on_key(key(KeyCode::F(4))).await.unwrap();
+        assert!(app.shortcut_bar_visible);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        for x in 0..100 {
+            assert_eq!(
+                terminal.backend().buffer()[(x, 23)].bg,
+                Color::Rgb(211, 211, 211)
+            );
+        }
+        app.on_key(key(KeyCode::F(6))).await.unwrap();
+        assert!(app.channels.items.is_empty());
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.on_key(key(KeyCode::F(7))).await.unwrap();
+        assert!(app.hidden_dialog.is_some());
+        app.on_paste("must not enter composer");
+        assert!(app.input.data.is_empty());
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.on_key(key(KeyCode::Enter)).await.unwrap();
+        app.on_key(key(KeyCode::Esc)).await.unwrap();
+        assert_eq!(app.input.data, "x");
+        app.on_key(key(KeyCode::F(4))).await.unwrap();
+        assert!(!app.shortcut_bar_visible);
+        terminal.backend_mut().resize(1, 1);
+        terminal.autoresize().unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn received_order_renderer_uses_display_key_for_selection_anchor() {
+        let (mut app, _, _) = crate::app::tests::test_app().await;
+        app.config.message_order = crate::config::MessageOrder::Received;
+        app.storage.set_message_order(app.config.message_order);
+        let channel = app.selected_channel_id().unwrap();
+        let sender = channel.user().unwrap();
+        for (timestamp, text) in [(9000, "first skewed clock"), (100, "later despite clock")] {
+            app.store_message(channel, Message::text(sender, timestamp, text.into()));
+        }
+        app.on_channel_changed();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.on_pgup();
+        assert_eq!(app.positions[&channel].selected, Some(100));
+        app.on_pgup();
+        assert_eq!(app.positions[&channel].selected, Some(9000));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.on_pgdn();
+        assert_eq!(app.positions[&channel].selected, Some(100));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.on_pgdn();
+        assert_eq!(app.positions[&channel].selected, None);
+    }
+
     const USER_ID: Uuid = Uuid::nil();
 
     // formatting test options
     const PREFIX: &str = "                  ";
     const WIDTH: usize = 60;
     const HEIGHT: usize = 10;
+
+    #[test]
+    fn attachment_labels_use_sanitized_filenames_and_preserve_paths() {
+        let mut msg = Message::text(USER_ID, 0, String::new());
+        let mut attachment = test_attachment();
+        attachment.filename = "/private/downloads/photo\nname.jpg".into();
+        let original_path = attachment.filename.clone();
+        msg.attachments.push(attachment);
+        let mut label = String::new();
+        add_attachments(&msg, &mut label, Some(false), false);
+        assert!(label.ends_with("photo�name.jpg"), "{label:?}");
+        assert!(!label.contains("/private/"));
+        assert!(!label.contains("file://"));
+        assert!(!label.contains('\n'));
+        assert_eq!(msg.attachments[0].filename, original_path);
+        label.clear();
+        add_attachments(&msg, &mut label, None, true);
+        assert_eq!(label, "<file:///private/downloads/photo�name.jpg>");
+    }
 
     fn test_attachment() -> Attachment {
         Attachment {
@@ -962,6 +2039,8 @@ mod tests {
             from_id: USER_ID,
             message: None,
             arrived_at: 1642334397421,
+            local_id: None,
+            is_edit_snapshot: false,
             quote: None,
             attachments: Default::default(),
             reactions: Default::default(),
@@ -975,6 +2054,118 @@ mod tests {
             expire_timer: None,
             expires_at: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_render_wraps_unicode_and_keeps_final_oversized_match_visible() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let (app, _, _) = crate::app::tests::test_app().await;
+        let body = format!("{}Żółw ŻÓŁW", "earlier words ".repeat(100));
+        let offset = body.rfind("ŻÓŁW").unwrap();
+        let msg = Message {
+            message: Some(body),
+            ..test_message()
+        };
+        let focus = crate::app::search::SearchFocus {
+            channel_id: app.selected_channel_id().unwrap(),
+            local_id: msg.storage_id(),
+            query: "żółw".to_owned(),
+            range: offset..offset + "ŻÓŁW".len(),
+            occurrence: 1,
+        };
+        for (width, height) in [(23, 5), (18, 4), (2, 1)] {
+            let item = display_search_message(
+                &name_resolver(),
+                &msg,
+                PREFIX,
+                width,
+                height,
+                ShowReceipt::Never,
+                &focus,
+            )
+            .unwrap();
+            assert!(item.height() <= height);
+            let mut terminal =
+                Terminal::new(TestBackend::new(width as u16, height as u16)).unwrap();
+            terminal
+                .draw(|frame| frame.render_widget(List::new(vec![item]), frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .any(|cell| cell.bg == Color::LightCyan),
+                "active match missing in {width}x{height}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn focused_message_preserves_decorations_mentions_and_graphemes() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let (app, _, _) = crate::app::tests::test_app().await;
+        let body = "￼ 👩‍💻 é needle";
+        let start = body.find("needle").unwrap();
+        let msg = Message {
+            message: Some(body.to_owned()),
+            quote: Some(Box::new(Message {
+                message: Some("quoted needle".to_owned()),
+                ..test_message()
+            })),
+            body_ranges: vec![BodyRange {
+                start: 0,
+                end: 1,
+                value: AssociatedValue::MentionUuid(USER_ID),
+            }],
+            attachments: vec![test_attachment()],
+            reactions: vec![(USER_ID, "👍".to_owned())],
+            edited: true,
+            ..test_message()
+        };
+        let focus = crate::app::search::SearchFocus {
+            channel_id: app.selected_channel_id().unwrap(),
+            local_id: msg.storage_id(),
+            query: "needle".to_owned(),
+            range: start..body.len(),
+            occurrence: 0,
+        };
+        let item = display_search_message(
+            &name_resolver(),
+            &msg,
+            PREFIX,
+            120,
+            15,
+            ShowReceipt::Never,
+            &focus,
+        )
+        .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 15)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(List::new(vec![item]), frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        for expected in [
+            "@boxdot",
+            "quoted needle",
+            "👩‍💻",
+            "é",
+            "[edited]",
+            "👍",
+            "signal-2022",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert_eq!(
+            buffer
+                .content
+                .iter()
+                .filter(|cell| cell.bg == Color::LightCyan)
+                .count(),
+            "needle".len()
+        );
+        assert!(buffer.content.iter().any(|cell| cell.symbol() == "👩‍💻"));
     }
 
     #[test]
@@ -994,6 +2185,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
 
         let expected = ListItem::new(Text::from(vec![
@@ -1032,6 +2224,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
 
         let expected = ListItem::new(Text::from(vec![
@@ -1072,6 +2265,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
 
         let expected = ListItem::new(Text::from(vec![
@@ -1114,6 +2308,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
 
         let expected = ListItem::new(Text::from(vec![Line::from(vec![
@@ -1148,6 +2343,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
 
         let expected = ListItem::new(Text::from(vec![Line::from(vec![
@@ -1182,6 +2378,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
 
         let expected = ListItem::new(Text::from(vec![Line::from(vec![
@@ -1216,6 +2413,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
 
         let expected = ListItem::new(Text::from(vec![Line::from(vec![
@@ -1252,6 +2450,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
 
         let expected = ListItem::new(Text::from(vec![Line::from(vec![
@@ -1300,6 +2499,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
 
         let expected = ListItem::new(Text::from(vec![
@@ -1338,6 +2538,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
 
         let expected = ListItem::new(Text::from(vec![
@@ -1377,6 +2578,7 @@ mod tests {
             None,
             Some(division.clone()),
             false,
+            None,
         );
 
         let expected = ListItem::new(Text::from(vec![
@@ -1393,5 +2595,33 @@ mod tests {
             ]),
         ]));
         assert_eq!(rendered, Some(expected));
+    }
+}
+
+#[cfg(test)]
+mod spelling_render_tests {
+    use super::*;
+    #[test]
+    fn unicode_error_style_survives_inserted_wrap_newlines() {
+        let original = "żółw błąd";
+        let (wrapped, _, _) = wrap(original, Cursor::default(), 3);
+        let start = original.find("błąd").unwrap();
+        let text = spelling_text(
+            &wrapped,
+            original,
+            &[crate::spellcheck::Misspelling {
+                range: start..original.len(),
+                word: "błąd".to_owned(),
+            }],
+            &[],
+        );
+        let marked: String = text
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(marked, "błąd");
     }
 }

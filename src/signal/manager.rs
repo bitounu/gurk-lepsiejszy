@@ -39,10 +39,13 @@ pub trait SignalManager {
 
     fn send_receipt(&self, sender_uuid: Uuid, timestamps: Vec<u64>, receipt: Receipt);
 
+    /// Sends read state only to our own linked devices, never to a contact.
+    fn send_read_sync(&self, read: Vec<(Uuid, u64)>) -> oneshot::Receiver<anyhow::Result<()>>;
+
     fn send_text(
         &self,
         channel: &Channel,
-        text: String,
+        text: crate::mentions::MessageText,
         quote_message: Option<&Message>,
         edit_message_timestamp: Option<u64>,
         attachments: Vec<(AttachmentSpec, Vec<u8>)>,

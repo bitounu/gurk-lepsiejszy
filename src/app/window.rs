@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
     app::App,
@@ -23,15 +23,16 @@ const FILL_MARGIN: usize = PAGE;
 ///
 /// # Invariants:
 ///
-/// * `items` is strictly ascending by arrived_at and contiguous
+/// * `items` is strictly ascending by configured display order and contiguous
 /// * no message exists in storage between `front` and `back` of `items`
 /// * `at_oldest` <=> nothing older than `front` exists in the storage
 /// * `at_newest` <=> nothing newer than `back` exists in the storage
 /// * `is_empty` <=> `at_oldest` and `at_newest` and `items` is empty (empty channel)
 pub(crate) struct MessageWindow {
     channel_id: ChannelId,
-    /// Contiguous list of messages in the window strictly ascending by arrived_at.
+    /// Contiguous list of messages in the window strictly ascending by configured display order.
     items: VecDeque<Message>,
+    keys: BTreeMap<u64, u64>,
     /// If true, there is nothing older than `front` in the storage.
     at_oldest: bool,
     /// If true, there is nothing newer than `back` in the storage.
@@ -68,6 +69,7 @@ impl MessageWindow {
         Self {
             channel_id,
             items: Default::default(),
+            keys: Default::default(),
             at_oldest: true,
             at_newest: true,
         }
@@ -75,12 +77,15 @@ impl MessageWindow {
 
     /// Load newest `limit` messages.
     pub(crate) fn load_tail(&mut self, storage: &dyn Storage, limit: usize) {
+        self.keys.clear();
         self.items = storage.messages_tail(self.channel_id, limit).into();
         self.at_newest = true;
         self.at_oldest = self.items.len() < limit;
+        self.refresh_keys(storage);
     }
 
     pub(crate) fn load_around(&mut self, storage: &dyn Storage, anchor: u64, limit: usize) {
+        self.keys.clear();
         self.items = storage
             .messages_before(self.channel_id, anchor, limit)
             .into();
@@ -91,6 +96,28 @@ impl MessageWindow {
         let suffix = storage.messages_after(self.channel_id, anchor, limit);
         self.at_newest = suffix.len() < limit;
         self.items.extend(suffix);
+        self.refresh_keys(storage);
+    }
+
+    fn retain_keys(&mut self) {
+        let loaded: BTreeSet<_> = self.items.iter().map(|m| m.storage_id()).collect();
+        self.keys.retain(|at, _| loaded.contains(at));
+    }
+
+    fn refresh_keys(&mut self, storage: &dyn Storage) {
+        self.retain_keys();
+        for message in &self.items {
+            self.keys.entry(message.storage_id()).or_insert_with(|| {
+                storage.message_sort_key(MessageId::new(self.channel_id, message.storage_id()))
+            });
+        }
+    }
+
+    fn key(&self, local_id: u64) -> (u64, u64) {
+        (
+            self.keys.get(&local_id).copied().unwrap_or(local_id),
+            local_id,
+        )
     }
 
     // Grow at edges
@@ -107,10 +134,12 @@ impl MessageWindow {
         for message in prefix.into_iter().rev() {
             self.items.push_front(message);
         }
+        self.refresh_keys(storage);
         if self.items.len() > MAX_WINDOW {
             self.items.truncate(MAX_WINDOW);
             self.at_newest = false;
         }
+        self.retain_keys();
     }
 
     pub(crate) fn extend_newer(&mut self, storage: &dyn Storage, count: usize) {
@@ -123,6 +152,7 @@ impl MessageWindow {
         let suffix = storage.messages_after(self.channel_id, newest, count);
         self.at_newest = suffix.len() < count;
         self.items.extend(suffix);
+        self.refresh_keys(storage);
         if self.items.len() > MAX_WINDOW {
             let to_remove = self.items.len() - MAX_WINDOW;
             for _ in 0..to_remove {
@@ -130,14 +160,24 @@ impl MessageWindow {
             }
             self.at_oldest = false;
         }
+        self.retain_keys();
     }
 
     // Mutate
 
+    #[cfg(test)]
     pub(crate) fn upsert(&mut self, message: Message) {
+        let key = message.arrived_at;
+        self.upsert_ordered(message, key);
+    }
+
+    pub(crate) fn upsert_ordered(&mut self, message: Message, key: u64) {
+        let local_id = message.storage_id();
+        self.keys.insert(local_id, key);
+        let key = (key, local_id);
         match self
             .items
-            .binary_search_by_key(&message.arrived_at, |m| m.arrived_at)
+            .binary_search_by_key(&key, |m| self.key(m.storage_id()))
         {
             Ok(pos) => {
                 self.items[pos] = message;
@@ -151,16 +191,16 @@ impl MessageWindow {
 
                 let (should_insert, trim) = match (self.oldest(), self.newest()) {
                     (Some(oldest), Some(newest))
-                        if oldest < message.arrived_at && message.arrived_at < newest =>
+                        if self.key(oldest) < key && key < self.key(newest) =>
                     {
                         // strictly interior; trimming at front is an arbitrary choice
                         (true, Trim::Front)
                     }
-                    (Some(oldest), _) if message.arrived_at < oldest && self.at_oldest => {
+                    (Some(oldest), _) if key < self.key(oldest) && self.at_oldest => {
                         // at the oldest edge
                         (true, Trim::Back)
                     }
-                    (_, Some(newest)) if newest < message.arrived_at && self.at_newest => {
+                    (_, Some(newest)) if self.key(newest) < key && self.at_newest => {
                         // at the newest edge
                         (true, Trim::Front)
                     }
@@ -189,16 +229,15 @@ impl MessageWindow {
                 }
             }
         }
+        self.retain_keys();
     }
 
     pub(crate) fn remove(&mut self, arrived_at: u64) {
-        let Ok(pos) = self
-            .items
-            .binary_search_by_key(&arrived_at, |m| m.arrived_at)
-        else {
+        let Some(pos) = self.items.iter().position(|m| m.storage_id() == arrived_at) else {
             return;
         };
         self.items.remove(pos);
+        self.keys.remove(&arrived_at);
     }
 
     // Read
@@ -214,7 +253,10 @@ impl MessageWindow {
     /// Number of loaded messages at or newer than `anchor` (all if `None`)
     pub(crate) fn loaded_below(&self, anchor: Option<u64>) -> usize {
         match anchor {
-            Some(anchor) => match self.items.binary_search_by_key(&anchor, |m| m.arrived_at) {
+            Some(anchor) => match self
+                .items
+                .binary_search_by_key(&self.key(anchor), |m| self.key(m.storage_id()))
+            {
                 Ok(pos) => self.items.len() - pos,
                 Err(insert_pos) => self.items.len() - insert_pos,
             },
@@ -225,7 +267,10 @@ impl MessageWindow {
     /// Number of loaded messages at or older than `anchor` (all if `None`)
     pub(crate) fn loaded_above(&self, anchor: Option<u64>) -> usize {
         match anchor {
-            Some(anchor) => match self.items.binary_search_by_key(&anchor, |m| m.arrived_at) {
+            Some(anchor) => match self
+                .items
+                .binary_search_by_key(&self.key(anchor), |m| self.key(m.storage_id()))
+            {
                 Ok(pos) => pos.saturating_add(1),
                 Err(insert_pos) => insert_pos,
             },
@@ -236,17 +281,17 @@ impl MessageWindow {
     pub(crate) fn get(&self, arrived_at: u64) -> Option<&Message> {
         let pos = self
             .items
-            .binary_search_by_key(&arrived_at, |m| m.arrived_at)
-            .ok()?;
+            .iter()
+            .position(|m| m.storage_id() == arrived_at)?;
         self.items.get(pos)
     }
 
     pub(crate) fn newest(&self) -> Option<u64> {
-        self.items.back().map(|m| m.arrived_at)
+        self.items.back().map(|m| m.storage_id())
     }
 
     pub(crate) fn oldest(&self) -> Option<u64> {
-        self.items.front().map(|m| m.arrived_at)
+        self.items.front().map(|m| m.storage_id())
     }
 
     pub(crate) fn at_oldest(&self) -> bool {
@@ -260,19 +305,19 @@ impl MessageWindow {
     pub(crate) fn older(&self, arrived_at: u64) -> Option<u64> {
         let pos = self
             .items
-            .binary_search_by_key(&arrived_at, |m| m.arrived_at)
-            .ok()?;
+            .iter()
+            .position(|m| m.storage_id() == arrived_at)?;
         let prev_pos = pos.checked_sub(1)?;
-        self.items.get(prev_pos).map(|m| m.arrived_at)
+        self.items.get(prev_pos).map(|m| m.storage_id())
     }
 
     pub(crate) fn newer(&self, arrived_at: u64) -> Option<u64> {
         let pos = self
             .items
-            .binary_search_by_key(&arrived_at, |m| m.arrived_at)
-            .ok()?;
+            .iter()
+            .position(|m| m.storage_id() == arrived_at)?;
         let next_pos = pos.checked_add(1)?;
-        self.items.get(next_pos).map(|m| m.arrived_at)
+        self.items.get(next_pos).map(|m| m.storage_id())
     }
 
     pub(crate) fn iter_rev_from(
@@ -282,8 +327,8 @@ impl MessageWindow {
         let end = match anchor {
             Some(anchor) => self
                 .items
-                .binary_search_by_key(&anchor, |m| m.arrived_at)
-                .ok()
+                .iter()
+                .position(|m| m.storage_id() == anchor)
                 .and_then(|pos| pos.checked_add(1))
                 .unwrap_or(self.items.len()),
             None => self.items.len(),
@@ -320,6 +365,7 @@ mod tests {
                 .iter()
                 .map(|&a| Message::text(FROM, a, format!("m{a}")))
                 .collect(),
+            keys: arrived_ats.iter().map(|&at| (at, at)).collect(),
             at_oldest,
             at_newest,
         }
@@ -341,6 +387,94 @@ mod tests {
             storage.store_message(ch(), &Message::text(FROM, a, format!("m{a}")));
         }
         storage
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn received_window_navigation_paging_and_upsert_ignore_clock_skew() {
+        let mut storage = storage_with(&[300, 100, 200, 50]).await;
+        storage.set_message_order(crate::config::MessageOrder::Received);
+        let mut w = MessageWindow::new(ch());
+        w.load_tail(&storage, 2);
+        assert_eq!(ats(&w), [200, 50]);
+        w.extend_older(&storage, 2);
+        assert_eq!(ats(&w), [300, 100, 200, 50]);
+        assert_eq!(w.older(100), Some(300));
+        assert_eq!(w.newer(100), Some(200));
+        assert_eq!(w.loaded_above(Some(100)), 2);
+        assert_eq!(w.loaded_below(Some(100)), 3);
+        assert_eq!(
+            w.iter_rev_from(Some(100))
+                .map(|m| m.arrived_at)
+                .collect::<Vec<_>>(),
+            [100, 300]
+        );
+        let edited = Message::text(FROM, 100, "Updated".into());
+        storage.store_message(ch(), &edited);
+        w.upsert_ordered(edited, storage.message_sort_key(MessageId::new(ch(), 100)));
+        let newest = Message::text(FROM, 25, "New".into());
+        storage.store_message(ch(), &newest);
+        w.upsert_ordered(newest, storage.message_sort_key(MessageId::new(ch(), 25)));
+        assert_eq!(ats(&w), [300, 100, 200, 50, 25]);
+        assert_eq!(w.get(100).unwrap().message.as_deref(), Some("Updated"));
+        w.remove(100);
+        assert_eq!(ats(&w), [300, 200, 50, 25]);
+        w.load_around(&storage, 100, 1);
+        assert_eq!(ats(&w), [300, 100, 200]);
+        w.extend_newer(&storage, 2);
+        assert_eq!(ats(&w), [300, 100, 200, 50, 25]);
+    }
+
+    #[test]
+    fn equal_protocol_times_keep_distinct_local_identities() {
+        let mut w = window(&[], true, true);
+        let mut first = Message::text(FROM, 100, "first".into());
+        first.local_id = Some(101);
+        let mut second = Message::text(Uuid::new_v4(), 100, "second".into());
+        second.local_id = Some(102);
+        // Insertion order does not change the local-ID tie break.
+        w.upsert(second.clone());
+        w.upsert(first);
+        assert_eq!(ats(&w), [100, 100]);
+        assert_eq!(w.oldest(), Some(101));
+        assert_eq!(w.newest(), Some(102));
+        assert_eq!(w.newer(101), Some(102));
+        assert_eq!(w.older(102), Some(101));
+        assert_eq!(w.loaded_above(Some(101)), 1);
+        assert_eq!(w.loaded_below(Some(102)), 1);
+        second.message = Some("edited second".into());
+        w.upsert(second);
+        assert_eq!(w.items.len(), 2);
+        assert_eq!(w.get(101).unwrap().message.as_deref(), Some("first"));
+        assert_eq!(
+            w.get(102).unwrap().message.as_deref(),
+            Some("edited second")
+        );
+        assert_eq!(w.iter_rev_from(Some(101)).count(), 1);
+        w.remove(102);
+        assert_eq!(w.newest(), Some(101));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn equal_protocol_times_survive_paging_and_load_around() {
+        let mut storage = storage_with(&[90, 100, 110]).await;
+        storage.store_message(
+            ch(),
+            &Message::text(Uuid::new_v4(), 100, "collision".into()),
+        );
+        let ids: Vec<_> = storage.messages(ch()).map(|m| m.storage_id()).collect();
+        assert_eq!(ids.len(), 4);
+        assert_ne!(ids[1], ids[2]);
+        let mut w = MessageWindow::new(ch());
+        w.load_tail(&storage, 1);
+        w.extend_older(&storage, 1);
+        w.extend_older(&storage, 1);
+        assert_eq!(ats(&w), [100, 100, 110]);
+        assert!(w.get(ids[1]).is_some());
+        assert!(w.get(ids[2]).is_some());
+        w.load_around(&storage, ids[1], 1);
+        assert_eq!(ats(&w), [90, 100, 100]);
+        w.extend_newer(&storage, 1);
+        assert_eq!(ats(&w), [90, 100, 100, 110]);
     }
 
     // --- read accessors (no storage) ---

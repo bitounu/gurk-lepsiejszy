@@ -53,6 +53,14 @@ impl<'a> NameResolver<'a> {
         }
     }
 
+    pub(crate) fn file_icon_setting(&self) -> Option<bool> {
+        self.app.map(|app| app.config.nerd_font_icons)
+    }
+
+    pub(crate) fn show_attachment_paths(&self) -> bool {
+        self.app.is_none_or(|app| app.config.show_attachment_paths)
+    }
+
     /// Returns name and color for the given id
     pub fn resolve(&self, id: Uuid) -> (Cow<'_, str>, Color) {
         self.names_and_colors
@@ -78,8 +86,13 @@ impl App {
     fn name_and_color(&self, id: Uuid) -> (String, Color) {
         let name = self.name_by_id_cached(id);
         let color = user_color(&name);
-        let name =
-            strip_ansi_escapes::strip_str(displayed_name(&name, self.config.first_name_only));
+        let name = strip_ansi_escapes::strip_str(displayed_name(
+            &name,
+            self.config.first_name_only
+                && !self
+                    .local_aliases
+                    .contains_key(&crate::storage::AliasTarget::Person(id)),
+        ));
         (name, color)
     }
 }
@@ -109,4 +122,19 @@ fn user_color(username: &str) -> Color {
         .bytes()
         .fold(0, |sum, b| (sum + usize::from(b)) % USER_COLORS.len());
     USER_COLORS[idx]
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use crate::storage::AliasTarget;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn person_alias_is_not_shortened() {
+        let (mut app, _, _) = crate::app::tests::test_app().await;
+        app.config.first_name_only = true;
+        app.set_local_alias(AliasTarget::Person(app.user_id), "Żółw z pracy 🐢")
+            .unwrap();
+        let (name, _) = app.name_and_color(app.user_id);
+        assert_eq!(name, "Żółw z pracy 🐢");
+    }
 }

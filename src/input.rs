@@ -5,22 +5,83 @@ use unicode_width::UnicodeWidthStr;
 use crate::cursor::Cursor;
 
 /// Input box with data and a cursor
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Input {
     pub data: String,
     pub cursor: Cursor,
     /// Original partial that started a tab-completion cycle (e.g., "th" for thumbsup).
     /// Set during cycling, cleared on any other input action.
     pub completion_partial: Option<String>,
+    pub mentions: Vec<crate::mentions::DraftMention>,
+    mention_text: String,
 }
 
 impl Input {
+    /// Reconcile direct editor/spelling changes as well as normal keystrokes.
+    pub fn sync_mentions(&mut self) {
+        crate::mentions::reconcile_mentions(&self.mention_text, &self.data, &mut self.mentions);
+        self.mention_text.clone_from(&self.data);
+    }
+
+    pub fn message_text(&mut self) -> crate::mentions::MessageText {
+        self.sync_mentions();
+        crate::mentions::MessageText {
+            text: self.data.clone(),
+            mentions: self.mentions.clone(),
+        }
+    }
+
+    pub fn replace_text(&mut self, text: String) {
+        self.sync_mentions();
+        self.data = text;
+        self.sync_mentions();
+        let payload = self.message_text();
+        self.set_message_text(payload);
+    }
+
+    pub fn set_message_text(&mut self, text: crate::mentions::MessageText) {
+        self.data = text.text;
+        self.mentions = text.mentions;
+        self.mention_text.clone_from(&self.data);
+        self.cursor = Cursor::default();
+        while self.cursor.idx < self.data.len() {
+            self.cursor.move_right(&self.data);
+        }
+        self.sync_mentions();
+    }
+
+    pub fn insert_mention(&mut self, range: std::ops::Range<usize>, name: &str, aci: uuid::Uuid) {
+        self.sync_mentions();
+        if self.data.get(range.clone()).is_none() {
+            return;
+        }
+        let label = format!("@{name}");
+        self.data.replace_range(range.clone(), &format!("{label} "));
+        self.sync_mentions();
+        self.mentions.push(crate::mentions::DraftMention {
+            start: range.start,
+            end: range.start + label.len(),
+            text: label,
+            aci,
+        });
+        self.cursor = Cursor::default();
+        let end = range.start + name.len() + 2;
+        while self.cursor.idx < end {
+            self.cursor.move_right(&self.data);
+        }
+        self.completion_partial = None;
+    }
+
     pub fn put_char(&mut self, c: char) {
+        self.sync_mentions();
         self.cursor.put(c, &mut self.data);
+        self.sync_mentions();
     }
 
     pub fn new_line(&mut self) {
+        self.sync_mentions();
         self.cursor.new_line(&mut self.data);
+        self.sync_mentions();
     }
 
     pub fn on_left(&mut self) {
@@ -56,23 +117,33 @@ impl Input {
     }
 
     pub fn on_backspace(&mut self) {
+        self.sync_mentions();
         self.cursor.delete_backward(&mut self.data);
+        self.sync_mentions();
     }
 
     pub fn on_delete(&mut self) {
+        self.sync_mentions();
         self.cursor.delete_forward(&mut self.data);
+        self.sync_mentions();
     }
 
     pub fn on_delete_line(&mut self) {
+        self.sync_mentions();
         self.cursor.delete_line_backward(&mut self.data);
+        self.sync_mentions();
     }
 
     pub fn on_delete_word(&mut self) {
+        self.sync_mentions();
         self.cursor.delete_word_backward(&mut self.data);
+        self.sync_mentions();
     }
 
     pub fn on_delete_suffix(&mut self) {
+        self.sync_mentions();
         self.cursor.delete_suffix(&mut self.data);
+        self.sync_mentions();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -81,13 +152,57 @@ impl Input {
 
     pub fn take(&mut self) -> String {
         self.cursor = Default::default();
+        self.mentions.clear();
+        self.mention_text.clear();
+        self.completion_partial = None;
         std::mem::take(&mut self.data)
+    }
+
+    /// Convert only plain tokens, applying one edit at a time to preserve mentions.
+    pub fn convert_ascii_emoticons(&mut self) {
+        self.sync_mentions();
+        let replacements = crate::emoji::ascii_emoticon_replacements(&self.data);
+        let mut cursor = self.cursor.idx;
+        let mut changed = false;
+        for (range, emoji) in replacements.into_iter().rev() {
+            if self
+                .mentions
+                .iter()
+                .any(|m| range.start < m.end && m.start < range.end)
+            {
+                continue;
+            }
+            cursor = if cursor <= range.start {
+                cursor
+            } else if cursor >= range.end {
+                cursor - range.len() + emoji.len()
+            } else {
+                range.start + emoji.len()
+            };
+            self.data.replace_range(range, emoji);
+            self.sync_mentions();
+            changed = true;
+        }
+        if changed {
+            let before = &self.data[..cursor];
+            self.cursor = Cursor::default();
+            self.cursor.idx = cursor;
+            self.cursor.line = before.chars().filter(|&c| c == '\n').count();
+            self.cursor.col = before.rsplit('\n').next().unwrap_or_default().width();
+            self.completion_partial = None;
+        }
     }
 
     /// If the character just before the cursor is `:`, look backwards for a
     /// matching opening `:` and check if it's a valid emoji shortcode. If so,
     /// replace `:shortcode:` with the actual emoji and adjust cursor position.
     pub fn convert_emoji_on_colon(&mut self) {
+        self.sync_mentions();
+        self.convert_emoji_on_colon_inner();
+        self.sync_mentions();
+    }
+
+    fn convert_emoji_on_colon_inner(&mut self) {
         let idx = self.cursor.idx;
         if idx < 1 || !self.data.is_char_boundary(idx) {
             return;
@@ -128,6 +243,13 @@ impl Input {
     /// complete or cycle to the next matching shortcode on each call.
     /// Returns true if a completion was made.
     pub fn try_complete_emoji(&mut self) -> bool {
+        self.sync_mentions();
+        let result = self.try_complete_emoji_inner();
+        self.sync_mentions();
+        result
+    }
+
+    fn try_complete_emoji_inner(&mut self) -> bool {
         let idx = self.cursor.idx;
         if idx < 1 {
             self.completion_partial = None;
@@ -385,5 +507,135 @@ mod tests {
         assert!(!input.try_complete_emoji());
         assert_eq!(input.data, "");
         assert_eq!(input.completion_partial, None);
+    }
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+    #[test]
+    fn confirmed_mention_tracks_edits_and_take_clears_identity() {
+        let mut input = Input::default();
+        for c in "Hej @Bar".chars() {
+            input.put_char(c);
+        }
+        let id = uuid::Uuid::new_v4();
+        input.insert_mention(4..8, "Bartosz Kowalski", id);
+        assert_eq!(input.data, "Hej @Bartosz Kowalski ");
+        assert_eq!(input.mentions[0].aci, id);
+        input.on_home();
+        input.put_char('🙂');
+        assert_eq!(input.mentions[0].start, 8);
+        input.on_end();
+        input.on_backspace(); // trailing space
+        assert_eq!(input.mentions.len(), 1);
+        input.on_backspace(); // edit name -> literal
+        assert!(input.mentions.is_empty());
+        input.take();
+        assert!(input.mentions.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ascii_emoticon_tests {
+    use super::*;
+
+    #[test]
+    fn ascii_emoticons_common_tokens_and_urls() {
+        let mut input = Input::default();
+        input.replace_text(
+            ":) :-) ;) ;-) :D :-D :P :p :-P :-p :( :-( :/ :-/ :| :-| :O :-o :'( <3".into(),
+        );
+        input.convert_ascii_emoticons();
+        assert_eq!(
+            input.data,
+            "🙂 🙂 😉 😉 😃 😃 😛 😛 😛 😛 🙁 🙁 😕 😕 😐 😐 😮 😮 😢 ❤️"
+        );
+        assert_eq!(input.cursor.col, input.data.width());
+        input.replace_text("❤️ :)".into());
+        input.convert_ascii_emoticons();
+        assert_eq!(input.data, "❤️ 🙂");
+        assert_eq!(input.cursor.col, 5);
+        let original =
+            "https://example.test/:/ C:/path x:) abc:| :)x :// :smile: `:)` \\:) e@:/ 🙂";
+        input.replace_text(original.into());
+        input.convert_ascii_emoticons();
+        assert_eq!(input.data, original);
+    }
+
+    #[test]
+    fn ascii_emoticons_preserve_confirmed_labels_and_unicode_cursor() {
+        let mut input = Input::default();
+        input.replace_text(":) @Bar :|".into());
+        let id = uuid::Uuid::new_v4();
+        input.insert_mention(3..7, "Bartosz :) Nowacki", id);
+        input.convert_ascii_emoticons();
+        assert_eq!(input.data, "🙂 @Bartosz :) Nowacki  😐");
+        assert_eq!(input.mentions.len(), 1);
+        assert_eq!(input.mentions[0].start, "🙂 ".len());
+        assert_eq!(input.mentions[0].text, "@Bartosz :) Nowacki");
+        assert_eq!(
+            input.cursor,
+            Cursor::new(
+                input.data.find("  😐").unwrap() + 1,
+                0,
+                input.data[..input.data.find("  😐").unwrap() + 1].width()
+            )
+        );
+        let (wire, ranges) = input.message_text().encode();
+        assert_eq!(wire, "🙂 \u{fffc}  😐");
+        assert_eq!((ranges[0].start, ranges[0].end), (3, 4));
+        assert_eq!(
+            ranges[0].value,
+            crate::data::AssociatedValue::MentionUuid(id)
+        );
+        input.replace_text("Zażółć\n:)\t:/\n:|".into());
+        input.on_home();
+        let old = input.cursor.clone();
+        input.convert_ascii_emoticons();
+        assert_eq!(input.data, "Zażółć\n🙂\t😕\n😐");
+        assert_eq!(
+            input.cursor,
+            Cursor::at(&input.data, "Zażółć\n🙂\t😕\n".len())
+        );
+        assert_eq!(input.cursor.line, old.line);
+    }
+}
+
+#[cfg(test)]
+mod ascii_heart_cursor_tests {
+    use super::*;
+    #[test]
+    fn ascii_heart_conversion_navigation_and_deletion_keep_cursor_aligned() {
+        let mut input = Input::default();
+        input.replace_text("<3 ".into());
+        input.convert_ascii_emoticons();
+        assert_eq!(input.data, "❤️ ");
+        for _ in 0..3 {
+            input.on_backspace();
+        }
+        assert_eq!(input.data, "");
+        assert_eq!(input.cursor, Cursor::begin());
+        input.put_char('x');
+        assert_eq!(input.cursor.col, 1);
+        input.replace_text("prefix <3\nsuffix".into());
+        input.convert_ascii_emoticons();
+        input.on_home();
+        input.on_left(); // newline -> previous line end
+        assert_eq!(input.cursor.col, "prefix ❤️".width());
+        input.on_left(); // variation selector
+        assert_eq!(input.cursor.col, "prefix ❤".width());
+        input.on_left(); // heart
+        assert_eq!(input.cursor.col, "prefix ".width());
+        input.on_right();
+        input.on_right();
+        assert_eq!(input.cursor.col, "prefix ❤️".width());
+        input.on_home();
+        assert_eq!(input.cursor.col, 0);
+        input.on_end();
+        assert_eq!(input.cursor.col, "prefix ❤️".width());
+        input.on_delete_line();
+        assert_eq!(input.data, "\nsuffix");
+        assert_eq!(input.cursor, Cursor::begin());
     }
 }

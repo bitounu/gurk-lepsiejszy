@@ -11,9 +11,7 @@ use presage::manager::Registered;
 use presage::model::contacts::Contact;
 use presage::model::groups::Group;
 use presage::proto::data_message::{Delete, Quote, Reaction};
-use presage::proto::{
-    AttachmentPointer, DataMessage, EditMessage, GroupContextV2, ReceiptMessage, SyncMessage,
-};
+use presage::proto::{AttachmentPointer, DataMessage, EditMessage, GroupContextV2, SyncMessage};
 use presage::store::ContentsStore;
 use presage::{
     libsignal_service::content::{Content, ContentBody},
@@ -23,7 +21,7 @@ use presage_store_sqlite::SqliteStore;
 use sha2::Digest;
 use tokio::sync::oneshot;
 use tokio_stream::{Stream, StreamExt};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::data::{Channel, ChannelId, GroupData, Message};
@@ -39,6 +37,7 @@ pub(super) struct PresageManager {
     manager: presage::Manager<SqliteStore, Registered>,
     data_dir: PathBuf,
     local_pool: LocalPool,
+    send_order: super::send_order::SendOrder,
 }
 
 impl PresageManager {
@@ -51,18 +50,39 @@ impl PresageManager {
             manager,
             data_dir,
             local_pool,
+            send_order: Default::default(),
         }
     }
+}
+
+/// Keep both the destination and payload construction together: contact ACIs are
+/// metadata in the encrypted self-sync, never transport destinations.
+fn private_read_sync(own: Uuid, read: Vec<(Uuid, u64)>) -> (ServiceId, ContentBody) {
+    (
+        ServiceId::Aci(own.into()),
+        ContentBody::SynchronizeMessage(SyncMessage {
+            read: read
+                .into_iter()
+                .map(|(sender, timestamp)| presage::proto::sync_message::Read {
+                    sender_aci: Some(sender.to_string()),
+                    sender_aci_binary: Some(sender.as_bytes().to_vec()),
+                    timestamp: Some(timestamp),
+                })
+                .collect(),
+            ..Default::default()
+        }),
+    )
 }
 
 #[async_trait(?Send)]
 impl SignalManager for PresageManager {
     fn clone_boxed(&self) -> Box<dyn SignalManager> {
-        Box::new(Self::new(
-            self.manager.clone(),
-            self.data_dir.clone(),
-            self.local_pool.clone(),
-        ))
+        Box::new(Self {
+            manager: self.manager.clone(),
+            data_dir: self.data_dir.clone(),
+            local_pool: self.local_pool.clone(),
+            send_order: self.send_order.clone(),
+        })
     }
 
     fn user_id(&self) -> Uuid {
@@ -118,37 +138,38 @@ impl SignalManager for PresageManager {
         rx
     }
 
-    fn send_receipt(&self, sender_uuid: Uuid, timestamps: Vec<u64>, receipt: Receipt) {
-        let now_timestamp = utc_now_timestamp_msec();
-        let data_message = ReceiptMessage {
-            r#type: Some(receipt.to_i32()),
-            timestamp: timestamps,
-        };
+    fn send_receipt(&self, _sender_uuid: Uuid, _timestamps: Vec<u64>, _receipt: Receipt) {
+        // Privacy boundary: never publish delivery/read activity to contacts.
+        // Private linked-device state uses send_read_sync with our own ACI.
+    }
 
+    fn send_read_sync(&self, read: Vec<(Uuid, u64)>) -> oneshot::Receiver<anyhow::Result<()>> {
+        let (tx, rx) = oneshot::channel();
+        let (destination, body) = private_read_sync(self.user_id(), read);
         let mut manager = self.manager.clone();
         self.local_pool.spawn(move || async move {
-            let body = ContentBody::ReceiptMessage(data_message);
-            if let Err(error) = manager
-                .send_message(ServiceId::Aci(sender_uuid.into()), body, now_timestamp)
+            let result = manager
+                .send_message(destination, body, utc_now_timestamp_msec())
                 .await
-            {
-                error!(%error, %sender_uuid, "failed to send receipt");
-            }
+                .map(|_| ())
+                .map_err(Into::into);
+            let _ = tx.send(result);
         });
+        rx
     }
 
     fn send_text(
         &self,
         channel: &Channel,
-        text: String,
+        text: crate::mentions::MessageText,
         quote_message: Option<&Message>,
         edit_message_timestamp: Option<u64>,
         attachments: Vec<(AttachmentSpec, Vec<u8>)>,
     ) -> (Message, oneshot::Receiver<anyhow::Result<()>>) {
-        let message: String = crate::emoji::replace_shortcodes(&text).into_owned();
+        let (message, body_ranges) = text.encode();
         let has_attachments = !attachments.is_empty();
 
-        let timestamp = utc_now_timestamp_msec();
+        let timestamp = crate::util::next_send_timestamp_msec();
 
         let quote = quote_message.map(|message| Quote {
             id: Some(message.arrived_at),
@@ -162,6 +183,9 @@ impl SignalManager for PresageManager {
 
         let mut data_message = DataMessage {
             body: Some(message.clone()),
+            body_ranges: body_ranges.iter().map(From::from).collect(),
+            required_protocol_version: (!body_ranges.is_empty())
+                .then_some(presage::proto::data_message::ProtocolVersion::Mentions as u32),
             quote,
             expire_timer: channel.expire_timer,
             ..Default::default()
@@ -192,18 +216,29 @@ impl SignalManager for PresageManager {
         }
 
         let (response_tx, response) = oneshot::channel();
+        let turn = self.send_order.reserve(channel.id);
         match channel.id {
             ChannelId::User(uuid) => {
                 let mut manager = self.manager.clone();
                 self.local_pool.spawn(move || async move {
+                    let _turn = turn.wait().await;
                     if let Err(error) =
-                        upload_attachments(&manager, attachments, &mut data_message).await
+                        upload_attachments(&manager, attachments, &mut data_message, timestamp)
+                            .await
                     {
                         error!(%error, "failed to upload attachments");
                         let _ = response_tx.send(Err(error));
                         return;
                     }
 
+                    let uploaded_count = data_message.attachments.len();
+                    if uploaded_count > 0 {
+                        info!(
+                            message_timestamp = timestamp,
+                            attachment_count = uploaded_count,
+                            "attachment_message_submit_start"
+                        );
+                    }
                     let body = if let Some(target_sent_timestamp) = edit_message_timestamp {
                         ContentBody::EditMessage(EditMessage {
                             target_sent_timestamp: Some(target_sent_timestamp),
@@ -221,6 +256,13 @@ impl SignalManager for PresageManager {
                         let _ = response_tx.send(Err(error.into()));
                         return;
                     }
+                    if uploaded_count > 0 {
+                        info!(
+                            message_timestamp = timestamp,
+                            attachment_count = uploaded_count,
+                            "attachment_message_submit_complete"
+                        );
+                    }
                     let _ = response_tx.send(Ok(()));
                 });
             }
@@ -236,14 +278,24 @@ impl SignalManager for PresageManager {
                     });
 
                     self.local_pool.spawn(move || async move {
+                        let _turn = turn.wait().await;
                         if let Err(error) =
-                            upload_attachments(&manager, attachments, &mut data_message).await
+                            upload_attachments(&manager, attachments, &mut data_message, timestamp)
+                                .await
                         {
                             error!(%error, "failed to upload attachments");
                             let _ = response_tx.send(Err(error));
                             return;
                         }
 
+                        let uploaded_count = data_message.attachments.len();
+                        if uploaded_count > 0 {
+                            info!(
+                                message_timestamp = timestamp,
+                                attachment_count = uploaded_count,
+                                "attachment_message_submit_start"
+                            );
+                        }
                         let body = if let Some(target_sent_timestamp) = edit_message_timestamp {
                             ContentBody::EditMessage(EditMessage {
                                 target_sent_timestamp: Some(target_sent_timestamp),
@@ -261,6 +313,13 @@ impl SignalManager for PresageManager {
                             let _ = response_tx.send(Err(error.into()));
                             return;
                         }
+                        if uploaded_count > 0 {
+                            info!(
+                                message_timestamp = timestamp,
+                                attachment_count = uploaded_count,
+                                "attachment_message_submit_complete"
+                            );
+                        }
                         let _ = response_tx.send(Ok(()));
                     });
                 } else {
@@ -273,11 +332,13 @@ impl SignalManager for PresageManager {
             from_id: self.user_id(),
             message: Some(message),
             arrived_at: timestamp,
+            local_id: None,
+            is_edit_snapshot: false,
             quote: quote_message,
             attachments: saved_attachments,
             reactions: Default::default(),
             receipt: Receipt::Sent,
-            body_ranges: Default::default(),
+            body_ranges,
             send_failed: Default::default(),
             attachment_downloads: Default::default(),
             edit: edit_message_timestamp,
@@ -538,16 +599,196 @@ async fn upload_attachments(
     manager: &presage::Manager<SqliteStore, Registered>,
     attachments: Vec<(AttachmentSpec, Vec<u8>)>,
     data_message: &mut DataMessage,
+    message_timestamp: u64,
 ) -> anyhow::Result<()> {
+    let expected_count = attachments.len();
+    if expected_count == 0 {
+        return Ok(());
+    }
+    info!(
+        message_timestamp,
+        expected_count,
+        total_bytes = attachments
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>(),
+        "attachment_batch_upload_start"
+    );
     let attachment_pointers = manager.upload_attachments(attachments).await?;
-    data_message.attachments = attachment_pointers
-        .into_iter()
-        .filter_map(|res| {
-            if let Err(e) = res.as_ref() {
-                error!("failed to upload attachment: {}", e);
-            }
-            res.ok()
-        })
-        .collect();
+    let actual_count = attachment_pointers.len();
+    for (index, result) in attachment_pointers.iter().enumerate() {
+        info!(
+            message_timestamp,
+            attachment_index = index + 1,
+            expected_count,
+            success = result.is_ok(),
+            "attachment_upload_result"
+        );
+    }
+    apply_uploaded_attachments(data_message, attachment_pointers, expected_count)?;
+    info!(
+        message_timestamp,
+        expected_count, actual_count, "attachment_batch_upload_complete"
+    );
     Ok(())
+}
+
+fn apply_uploaded_attachments(
+    data_message: &mut DataMessage,
+    attachment_pointers: Vec<
+        Result<AttachmentPointer, presage::libsignal_service::sender::AttachmentUploadError>,
+    >,
+    expected_count: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        attachment_pointers.len() == expected_count,
+        "Incomplete attachment upload: expected {} files, received {} results; message was not sent",
+        expected_count,
+        attachment_pointers.len()
+    );
+    // Presage reports an outer request result and one result per uploaded file.
+    // Never send a reduced payload if any file failed (including image-only sends).
+    let pointers = attachment_pointers
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.with_context(|| format!("Attachment {} upload failed", index + 1))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    data_message.attachments = pointers;
+    Ok(())
+}
+
+#[cfg(test)]
+mod attachment_upload_tests {
+    use super::*;
+    use presage::libsignal_service::sender::AttachmentUploadError;
+
+    fn upload_failure() -> Result<AttachmentPointer, AttachmentUploadError> {
+        Err(std::io::Error::other("fixture upload refused").into())
+    }
+
+    #[test]
+    fn short_successful_upload_batch_cannot_drop_three_of_six_files() {
+        let original = AttachmentPointer {
+            file_name: Some("existing.txt".into()),
+            ..Default::default()
+        };
+        let mut message = DataMessage {
+            attachments: vec![original.clone()],
+            ..Default::default()
+        };
+        let result = apply_uploaded_attachments(
+            &mut message,
+            (0..3).map(|_| Ok(AttachmentPointer::default())).collect(),
+            6,
+        );
+        assert!(
+            result.is_err(),
+            "three returned pointers must not count as six successful uploads"
+        );
+        assert_eq!(message.attachments, vec![original]);
+    }
+
+    #[test]
+    fn six_successful_uploads_keep_every_filename_and_order() {
+        let pointers: Vec<_> = (0..6)
+            .map(|index| AttachmentPointer {
+                file_name: Some(format!("file{index}.jpg")),
+                ..Default::default()
+            })
+            .collect();
+        let mut message = DataMessage::default();
+        apply_uploaded_attachments(&mut message, pointers.iter().cloned().map(Ok).collect(), 6)
+            .unwrap();
+        assert_eq!(message.attachments, pointers);
+    }
+
+    #[test]
+    fn failed_image_upload_aborts_instead_of_sending_empty_message() {
+        let mut message = DataMessage {
+            body: Some(String::new()),
+            ..Default::default()
+        };
+        let result = apply_uploaded_attachments(&mut message, vec![upload_failure()], 1);
+        assert!(
+            result.is_err(),
+            "must abort sending when the only image failed to upload"
+        );
+        let reason = format!("{:#}", result.unwrap_err());
+        assert!(reason.contains("Attachment 1 upload failed"));
+        assert!(reason.contains("fixture upload refused"));
+    }
+
+    #[test]
+    fn partial_upload_failure_preserves_payload_and_aborts_caption_send() {
+        let existing = AttachmentPointer {
+            file_name: Some("existing.txt".into()),
+            ..Default::default()
+        };
+        let mut message = DataMessage {
+            body: Some("caption".into()),
+            attachments: vec![existing.clone()],
+            ..Default::default()
+        };
+        let result = apply_uploaded_attachments(
+            &mut message,
+            vec![Ok(AttachmentPointer::default()), upload_failure()],
+            2,
+        );
+        assert!(
+            result.is_err(),
+            "must not send a caption with a missing attachment"
+        );
+        assert_eq!(message.attachments, vec![existing]);
+        assert_eq!(message.body.as_deref(), Some("caption"));
+    }
+
+    #[test]
+    fn successful_upload_keeps_complete_server_pointers() {
+        use presage::proto::attachment_pointer::AttachmentIdentifier;
+        let pointer = AttachmentPointer {
+            content_type: Some("image/png".into()),
+            key: Some(vec![42; 64]),
+            digest: Some(vec![9; 32]),
+            cdn_number: Some(3),
+            attachment_identifier: Some(AttachmentIdentifier::CdnKey("fixture-cdn-key".into())),
+            size: Some(10),
+            ..Default::default()
+        };
+        let mut message = DataMessage::default();
+        apply_uploaded_attachments(&mut message, vec![Ok(pointer.clone())], 1).unwrap();
+        assert_eq!(message.attachments, vec![pointer]);
+        apply_uploaded_attachments(&mut message, vec![], 0).unwrap();
+        assert!(message.attachments.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod private_read_sync_tests {
+    use super::*;
+
+    #[test]
+    fn read_sync_is_addressed_to_self_and_contains_only_reads() {
+        let own = Uuid::new_v4();
+        let sender = Uuid::new_v4();
+        let (destination, body) = private_read_sync(own, vec![(sender, 42)]);
+        assert_eq!(destination, ServiceId::Aci(own.into()));
+        let ContentBody::SynchronizeMessage(sync) = body else {
+            panic!("expected sync")
+        };
+        assert_eq!(sync.read.len(), 1);
+        assert_eq!(
+            sync.read[0].sender_aci.as_deref(),
+            Some(sender.to_string().as_str())
+        );
+        assert_eq!(
+            sync.read[0].sender_aci_binary.as_deref(),
+            Some(sender.as_bytes().as_slice())
+        );
+        assert_eq!(sync.read[0].timestamp, Some(42));
+        assert!(sync.viewed.is_empty());
+        assert!(sync.sticker_pack_operation.is_empty());
+        assert!(sync.content.is_none());
+    }
 }

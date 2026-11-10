@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-use std::cmp::Reverse;
 use std::time::Instant;
 
 use anyhow::{Context as _, anyhow};
@@ -28,12 +26,27 @@ use super::{
 
 impl App {
     /// Stores the `message` in the storage and updates the message window if the channel matches.
-    pub(crate) fn store_message(&mut self, channel_id: ChannelId, message: Message) {
+    pub(crate) fn store_message(&mut self, channel_id: ChannelId, mut message: Message) {
         self.storage.store_message(channel_id, &message);
+        // Receipt/read/failure updates also target revision records. Persist
+        // them without exposing edit history as separate conversation entries.
+        if message.edit.is_some() || message.is_edit_snapshot {
+            return;
+        }
+        if let Some(stored) =
+            self.storage
+                .message_by_protocol(channel_id, message.from_id, message.arrived_at)
+        {
+            // Keep transient attachment download state while adopting the assigned identity.
+            message.local_id = stored.local_id;
+        }
         if let Some(window) = self.window.as_mut()
             && window.channel_id() == channel_id
         {
-            window.upsert(message);
+            let key = self
+                .storage
+                .message_sort_key(MessageId::new(channel_id, message.storage_id()));
+            window.upsert_ordered(message, key);
         }
     }
 
@@ -53,7 +66,10 @@ impl App {
         if let Some(window) = self.window.as_mut()
             && window.channel_id() == channel_id
         {
-            window.upsert(message);
+            let key = self
+                .storage
+                .message_sort_key(MessageId::new(channel_id, message.storage_id()));
+            window.upsert_ordered(message, key);
         }
         Some(())
     }
@@ -70,7 +86,9 @@ impl App {
 
         let user_id = self.user_id;
 
-        if let ContentBody::SynchronizeMessage(SyncMessage { ref read, .. }) = content.body {
+        if let ContentBody::SynchronizeMessage(SyncMessage { ref read, .. }) = content.body
+            && content.metadata.sender.raw_uuid() == user_id
+        {
             self.handle_read(read);
         }
 
@@ -97,8 +115,14 @@ impl App {
                 ),
             ) => {
                 if let Some(channel_id) = sync_message.channel_id() {
-                    let message_id = MessageId::new(channel_id, target_sent_timestamp);
-                    self.storage.delete_message(message_id);
+                    if let Some(message) = self.storage.message_by_protocol(
+                        channel_id,
+                        self.user_id,
+                        target_sent_timestamp,
+                    ) {
+                        self.storage
+                            .delete_message(MessageId::new(channel_id, message.storage_id()));
+                    }
                     info!(target_sent_timestamp, "message deleted via sync");
                 } else {
                     warn!(
@@ -127,9 +151,26 @@ impl App {
                     };
                     for msg in &msg_delete.messages {
                         if let Some(ts) = msg.sent_timestamp {
-                            let message_id = MessageId::new(channel_id, ts);
+                            use presage::proto::addressable_message::Author;
+                            let author = match msg.author.as_ref() {
+                                Some(Author::AuthorServiceId(value)) => {
+                                    parse_uuid(Some(value), None)
+                                }
+                                Some(Author::AuthorServiceIdBinary(value)) => {
+                                    ServiceId::parse_from_service_id_binary(value)
+                                        .map(|id| id.raw_uuid())
+                                }
+                                _ => None,
+                            };
+                            let Some(message) = author.and_then(|author| {
+                                self.storage.message_by_protocol(channel_id, author, ts)
+                            }) else {
+                                continue;
+                            };
+                            let local_id = message.storage_id();
+                            let message_id = MessageId::new(channel_id, local_id);
                             self.storage.remove_message(message_id);
-                            self.remove_message_from_view(channel_id, ts);
+                            self.remove_message_from_view(channel_id, local_id);
                             info!(sent_timestamp = ts, "message removed via delete-for-me");
                         }
                     }
@@ -223,14 +264,15 @@ impl App {
                     ChannelId::User(uuid)
                 };
 
-                let channel_muted = self
-                    .storage
-                    .channel(channel_id)
-                    .map(|c| c.muted)
-                    .unwrap_or(false);
+                let channel_muted = self.is_locally_muted(channel_id, sender.raw_uuid());
                 self.handle_reaction(
                     channel_id,
                     target_sent_timestamp,
+                    parse_uuid(
+                        target_author_aci_str.as_deref(),
+                        target_author_aci_binary.as_deref(),
+                    )
+                    .context("missing target author ACI in reaction")?,
                     sender.raw_uuid(),
                     emoji,
                     HandleReactionOptions::new()
@@ -284,14 +326,15 @@ impl App {
                     ChannelId::User(sender.raw_uuid())
                 };
 
-                let channel_muted = self
-                    .storage
-                    .channel(channel_id)
-                    .map(|c| c.muted)
-                    .unwrap_or(false);
+                let channel_muted = self.is_locally_muted(channel_id, sender.raw_uuid());
                 self.handle_reaction(
                     channel_id,
                     target_sent_timestamp,
+                    parse_uuid(
+                        target_author_aci_str.as_deref(),
+                        target_author_aci_binary.as_deref(),
+                    )
+                    .context("missing target author ACI in reaction")?,
                     sender.raw_uuid(),
                     emoji,
                     HandleReactionOptions::new()
@@ -411,8 +454,11 @@ impl App {
                         .await
                 };
 
-                let message_id = MessageId::new(channel_id, target_sent_timestamp);
-                if self.storage.delete_message(message_id) {
+                let message_id = self
+                    .storage
+                    .message_by_protocol(channel_id, sender.raw_uuid(), target_sent_timestamp)
+                    .map(|message| MessageId::new(channel_id, message.storage_id()));
+                if message_id.is_some_and(|id| self.storage.delete_message(id)) {
                     info!(target_sent_timestamp, "message deleted remotely");
                 } else {
                     warn!(
@@ -438,7 +484,7 @@ impl App {
                     ..
                 }),
             ) => {
-                let (channel_id, from, channel_muted) = if let Some(GroupContextV2 {
+                let (channel_id, channel_muted) = if let Some(GroupContextV2 {
                     master_key: Some(master_key),
                     revision: Some(revision),
                     ..
@@ -464,9 +510,9 @@ impl App {
 
                     self.ensure_user_is_known(sender.raw_uuid(), profile_key)
                         .await;
-                    let from = self.name_by_id(sender.raw_uuid()).await;
+                    self.name_by_id(sender.raw_uuid()).await;
                     let channel = self.channel(channel_id).expect("non-existent channel");
-                    (channel_id, from, channel.muted)
+                    (channel_id, channel.muted)
                 } else {
                     // incoming direct message
                     let profile_key = profile_key
@@ -480,15 +526,14 @@ impl App {
                         .ensure_contact_channel_exists(sender.raw_uuid(), &name)
                         .await;
                     // Reset typing notification as the Tipyng::Stop are not always sent by the server when a message is sent.
-                    let (from, channel_muted) = {
-                        let channel = self.channel(channel_id).expect("non-existent channel");
-                        (channel.name.clone(), channel.muted)
-                    };
-                    self.channels
-                        .modify_channel_by_id(&mut *self.storage, channel_id, |channel| {
-                            channel.reset_writing(sender.raw_uuid())
-                        });
-                    (channel_id, from, channel_muted)
+                    let channel_muted = self
+                        .channel(channel_id)
+                        .expect("non-existent channel")
+                        .muted;
+                    self.modify_channel_by_id(channel_id, |channel| {
+                        channel.reset_writing(sender.raw_uuid())
+                    });
+                    (channel_id, channel_muted)
                 };
 
                 add_emoji_from_sticker(&mut body, sticker);
@@ -496,7 +541,8 @@ impl App {
                 // Update channel's expire timer if it changed
                 self.update_channel_expire_timer(channel_id, expire_timer);
 
-                if !channel_muted {
+                if !channel_muted && !self.is_locally_muted(channel_id, sender.raw_uuid()) {
+                    let from = self.notification_origin(channel_id, sender.raw_uuid());
                     self.notify_about_message(&from, body.as_deref(), attachment_pointers.len());
                 }
 
@@ -638,10 +684,17 @@ impl App {
             }
         };
 
-        let message_id = MessageId::new(channel_id, message.arrived_at);
+        let (sender, timestamp) = (message.from_id, message.arrived_at);
         self.add_message_to_channel(channel_id, message);
-        if !attachment_pointers.is_empty() {
-            self.save_attachments(message_id, attachment_pointers);
+        if !attachment_pointers.is_empty()
+            && let Some(message) = self
+                .storage
+                .message_by_protocol(channel_id, sender, timestamp)
+        {
+            self.save_attachments(
+                MessageId::new(channel_id, message.storage_id()),
+                attachment_pointers,
+            );
         }
 
         Ok(())
@@ -709,15 +762,14 @@ impl App {
 
     fn update_channel_expire_timer(&mut self, channel_id: ChannelId, expire_timer: Option<u32>) {
         let new_timer = expire_timer.filter(|&t| t > 0);
-        self.channels
-            .modify_channel_by_id(&mut *self.storage, channel_id, |channel| {
-                if channel.expire_timer != new_timer {
-                    channel.expire_timer = new_timer;
-                    true
-                } else {
-                    false
-                }
-            });
+        self.modify_channel_by_id(channel_id, |channel| {
+            if channel.expire_timer != new_timer {
+                channel.expire_timer = new_timer;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     pub fn step_receipts(&mut self) {
@@ -728,16 +780,12 @@ impl App {
     pub fn expire_typing_indicators(&mut self) {
         // Can't iterate through channels and update them at the same time
         let writing: Vec<ChannelId> = self
-            .channels()
-            .iter()
+            .all_channels()
             .filter(|channel| channel.is_writing())
             .map(|channel| channel.id)
             .collect();
         for channel_id in writing {
-            self.channels
-                .modify_channel_by_id(&mut *self.storage, channel_id, |channel| {
-                    channel.expire_typing()
-                });
+            self.modify_channel_by_id(channel_id, |channel| channel.expire_typing());
         }
     }
 
@@ -749,47 +797,39 @@ impl App {
         _timestamp: u64,
     ) -> Result<(), ()> {
         if let Some(gid) = group_id {
-            self.channels.modify_channel_by_id(
-                &mut *self.storage,
-                ChannelId::Group(gid),
-                |channel| {
-                    if let TypingSet::GroupTyping(ref mut map) = channel.typing {
-                        match action {
-                            TypingAction::Started => {
-                                map.insert(sender_uuid, Instant::now());
-                            }
-                            TypingAction::Stopped => {
-                                map.remove(&sender_uuid);
-                            }
+            self.modify_channel_by_id(ChannelId::Group(gid), |channel| {
+                if let TypingSet::GroupTyping(ref mut map) = channel.typing {
+                    match action {
+                        TypingAction::Started => {
+                            map.insert(sender_uuid, Instant::now());
                         }
-                        true
-                    } else {
-                        error!("Got a single typing instead of hash set on a group");
-                        false
+                        TypingAction::Stopped => {
+                            map.remove(&sender_uuid);
+                        }
                     }
-                },
-            );
+                    true
+                } else {
+                    error!("Got a single typing instead of hash set on a group");
+                    false
+                }
+            });
         } else {
-            self.channels.modify_channel_by_id(
-                &mut *self.storage,
-                ChannelId::User(sender_uuid),
-                |channel| {
-                    if let TypingSet::SingleTyping(_) = channel.typing {
-                        match action {
-                            TypingAction::Started => {
-                                channel.typing = TypingSet::SingleTyping(Some(Instant::now()));
-                            }
-                            TypingAction::Stopped => {
-                                channel.typing = TypingSet::SingleTyping(None);
-                            }
+            self.modify_channel_by_id(ChannelId::User(sender_uuid), |channel| {
+                if let TypingSet::SingleTyping(_) = channel.typing {
+                    match action {
+                        TypingAction::Started => {
+                            channel.typing = TypingSet::SingleTyping(Some(Instant::now()));
                         }
-                        true
-                    } else {
-                        error!("Got a hash set instead of single typing on a direct chat");
-                        false
+                        TypingAction::Stopped => {
+                            channel.typing = TypingSet::SingleTyping(None);
+                        }
                     }
-                },
-            );
+                    true
+                } else {
+                    error!("Got a hash set instead of single typing on a direct chat");
+                    false
+                }
+            });
         }
         Ok(())
     }
@@ -800,8 +840,7 @@ impl App {
 
     fn handle_receipt(&mut self, sender_uuid: Uuid, receipt: Receipt, mut timestamps: Vec<u64>) {
         let sender_channels: Vec<ChannelId> = self
-            .channels()
-            .iter()
+            .all_channels()
             .filter(|channel| match channel.id {
                 ChannelId::User(uuid) => uuid == sender_uuid,
                 ChannelId::Group(_) => channel
@@ -813,43 +852,23 @@ impl App {
             .map(|channel| channel.id)
             .collect();
 
-        timestamps.sort_unstable_by_key(|&ts| Reverse(ts));
-        if timestamps.is_empty() {
-            return;
-        }
-
-        let mut found_channel_id = None;
-        let mut messages_to_store = Vec::new();
-
-        'outer: for channel_id in sender_channels {
-            let mut messages = self.storage.messages(channel_id).rev();
-            for &ts in &timestamps {
-                // Note: `&mut` is needed to advance the iterator `messages` with each `ts`.
-                // Since these are sorted in reverse order, we can continue advancing messages
-                // without consuming them.
-                if let Some(msg) = (&mut messages)
-                    .take_while(|msg| msg.arrived_at >= ts)
-                    .find(|msg| msg.arrived_at == ts)
+        timestamps.sort_unstable();
+        timestamps.dedup();
+        let mut updates = Vec::new();
+        for channel_id in sender_channels {
+            for &timestamp in &timestamps {
+                if let Some(mut message) =
+                    self.storage
+                        .message_by_protocol(channel_id, self.user_id, timestamp)
+                    && message.receipt < receipt
                 {
-                    let mut msg = msg;
-                    if msg.receipt < receipt {
-                        msg.receipt = msg.receipt.max(receipt);
-                        messages_to_store.push(msg);
-                    }
-                    found_channel_id = Some(channel_id);
+                    message.receipt = receipt;
+                    updates.push((channel_id, message));
                 }
             }
-
-            if found_channel_id.is_some() {
-                // if one ts was found, then all other ts have to be in the same channel
-                break 'outer;
-            }
         }
-
-        if let Some(channel_id) = found_channel_id {
-            for message in messages_to_store {
-                self.store_message(channel_id, message);
-            }
+        for (channel_id, message) in updates {
+            self.store_message(channel_id, message);
         }
     }
 
@@ -857,6 +876,7 @@ impl App {
         &mut self,
         channel_id: ChannelId,
         target_sent_timestamp: u64,
+        target_author: Uuid,
         sender_uuid: Uuid,
         emoji: String,
         HandleReactionOptions {
@@ -865,9 +885,9 @@ impl App {
             bell,
         }: HandleReactionOptions,
     ) -> Option<()> {
-        let mut message = self
-            .storage
-            .message(MessageId::new(channel_id, target_sent_timestamp))?;
+        let mut message =
+            self.storage
+                .message_by_protocol(channel_id, target_author, target_sent_timestamp)?;
         let from_current_user = self.user_id == message.from_id;
 
         let reaction_idx = message
@@ -897,22 +917,14 @@ impl App {
                 notification.push_str(text);
             }
 
-            // makes borrow checker happy
-            let channel = self.storage.channel(channel_id)?;
-            let channel_name = channel.name.clone();
+            self.name_by_id(sender_uuid).await;
+            let summary = self.notification_origin(channel_id, sender_uuid);
 
-            let sender_name = self.name_by_id(sender_uuid).await;
-            let summary = if let ChannelId::Group(_) = channel_id {
-                Cow::from(format!("{sender_name} in {channel_name}"))
-            } else {
-                Cow::from(sender_name)
-            };
-
-            if notify {
+            if notify && !self.is_locally_muted(channel_id, sender_uuid) {
                 self.notify(&summary, &format!("{summary} {notification}"));
             }
 
-            if bell {
+            if bell && !self.is_locally_muted(channel_id, sender_uuid) {
                 self.bell();
             }
 
@@ -999,36 +1011,69 @@ impl App {
             return;
         }
 
-        let mut read_at: Vec<_> = read.iter().filter_map(|read| read.timestamp).collect();
-        read_at.sort_unstable();
-
-        let mut updates = Vec::new();
-        for channel in self.channels() {
-            // skip channels without unread messages
-            if channel.unread_messages == 0 {
-                continue;
-            }
-
-            // find the last read message in this channel
-            let Some(last_read_at) = read_at.iter().rev().copied().find(|&timestamp| {
-                self.storage
-                    .message(MessageId::new(channel.id, timestamp))
-                    .is_some()
-            }) else {
-                continue;
-            };
-
-            let num_unread = self.storage.messages_count_after(channel.id, last_read_at);
-            updates.push((channel.id, (num_unread as u32).min(channel.unread_messages)));
+        let read_keys: std::collections::BTreeSet<_> = read
+            .iter()
+            .filter_map(|read| {
+                let legacy = read
+                    .sender_aci
+                    .as_deref()
+                    .map(Uuid::parse_str)
+                    .transpose()
+                    .ok()?;
+                let sender = match read.sender_aci_binary.as_deref() {
+                    Some(binary) => {
+                        let sender = Uuid::from_slice(binary).ok()?;
+                        if legacy.is_some_and(|legacy| legacy != sender) {
+                            return None;
+                        }
+                        sender
+                    }
+                    None => legacy?,
+                };
+                Some((sender, read.timestamp?))
+            })
+            .collect();
+        if read_keys.is_empty() {
+            return;
         }
 
-        // Can't iterate though channels and update them at the same time
-        for (channel_id, unread_messages) in updates {
-            self.channels
-                .modify_channel_by_id(&mut *self.storage, channel_id, |channel| {
-                    channel.unread_messages = unread_messages;
-                    true
-                });
+        let mut message_updates = Vec::new();
+        let mut channel_updates = Vec::new();
+        for channel in self.all_channels() {
+            let mut newly_read = 0u32;
+            // Read sync identifies exact messages. Use indexed lookups instead
+            // of decoding every stored message whenever a linked device reads.
+            for &(sender, timestamp) in &read_keys {
+                let Some(mut message) = self
+                    .storage
+                    .message_by_protocol(channel.id, sender, timestamp)
+                else {
+                    continue;
+                };
+                if message.from_id != sender || message.receipt == Receipt::Read {
+                    continue;
+                }
+                if message.from_id != self.user_id && !message.deleted {
+                    newly_read = newly_read.saturating_add(1);
+                }
+                message.receipt = Receipt::Read;
+                message_updates.push((channel.id, message));
+            }
+            if newly_read > 0 {
+                channel_updates.push((
+                    channel.id,
+                    channel.unread_messages.saturating_sub(newly_read),
+                ));
+            }
+        }
+        for (channel_id, message) in message_updates {
+            self.store_message(channel_id, message);
+        }
+        for (channel_id, unread_messages) in channel_updates {
+            self.modify_channel_by_id(channel_id, |channel| {
+                channel.unread_messages = unread_messages;
+                true
+            });
         }
     }
 }
@@ -1105,6 +1150,156 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn edit_receipts_never_insert_history_versions_into_message_window() {
+        let (mut app, _, _) = test_app().await;
+        let channel = app.selected_channel_id().unwrap();
+        let peer = channel.user().unwrap();
+        app.on_pgup();
+        for timestamp in 1..=3 {
+            app.store_edited_message(
+                channel,
+                timestamp - 1,
+                Message::text(app.user_id, timestamp, format!("edit {timestamp}")),
+            )
+            .unwrap();
+            app.handle_receipt(peer, Receipt::Delivered, vec![timestamp]);
+            app.handle_receipt(peer, Receipt::Read, vec![timestamp]);
+            let window = app.window.as_ref().unwrap();
+            assert_eq!(window.newest(), Some(0));
+            assert!(window.get(timestamp).is_none());
+            assert_eq!(
+                window.get(0).unwrap().message.as_deref(),
+                Some(format!("edit {timestamp}").as_str())
+            );
+        }
+        assert_eq!(app.storage.messages(channel).count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn colliding_protocol_times_keep_distinct_window_and_event_targets() {
+        let (mut app, _, _) = test_app().await;
+        let channel = app.selected_channel_id().unwrap();
+        let peer = channel.user().unwrap();
+        let timestamp = 100;
+        app.window = Some(super::super::window::MessageWindow::new(channel));
+        let mut own = Message::text(app.user_id, timestamp, "own".into());
+        own.receipt = Receipt::Sent;
+        app.store_message(channel, own);
+        let mut incoming = Message::text(peer, timestamp, "incoming".into());
+        incoming.receipt = Receipt::Delivered;
+        app.store_message(channel, incoming);
+
+        let own = app
+            .storage
+            .message_by_protocol(channel, app.user_id, timestamp)
+            .unwrap();
+        let incoming = app
+            .storage
+            .message_by_protocol(channel, peer, timestamp)
+            .unwrap();
+        assert_ne!(own.storage_id(), incoming.storage_id());
+        assert_eq!(own.arrived_at, timestamp);
+        assert_eq!(incoming.arrived_at, timestamp);
+        let window = app.window.as_ref().unwrap();
+        assert_eq!(
+            window.get(own.storage_id()).unwrap().message.as_deref(),
+            Some("own")
+        );
+        assert_eq!(
+            window
+                .get(incoming.storage_id())
+                .unwrap()
+                .message
+                .as_deref(),
+            Some("incoming")
+        );
+
+        app.handle_reaction(
+            channel,
+            timestamp,
+            peer,
+            app.user_id,
+            "👍".into(),
+            HandleReactionOptions::new(),
+        )
+        .await;
+        assert!(
+            app.storage
+                .message_by_protocol(channel, app.user_id, timestamp)
+                .unwrap()
+                .reactions
+                .is_empty()
+        );
+        assert_eq!(
+            app.storage
+                .message_by_protocol(channel, peer, timestamp)
+                .unwrap()
+                .reactions
+                .len(),
+            1
+        );
+
+        app.handle_receipt(peer, Receipt::Read, vec![timestamp]);
+        assert_eq!(
+            app.storage
+                .message_by_protocol(channel, app.user_id, timestamp)
+                .unwrap()
+                .receipt,
+            Receipt::Read
+        );
+        assert_eq!(
+            app.storage
+                .message_by_protocol(channel, peer, timestamp)
+                .unwrap()
+                .receipt,
+            Receipt::Delivered
+        );
+        app.handle_read(&[Read {
+            sender_aci: Some(peer.to_string()),
+            timestamp: Some(timestamp),
+            ..Default::default()
+        }]);
+        assert_eq!(
+            app.storage
+                .message_by_protocol(channel, peer, timestamp)
+                .unwrap()
+                .receipt,
+            Receipt::Read
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hidden_conversations_keep_delivery_and_linked_read_updates() {
+        let (mut app, _, _) = test_app().await;
+        let id = app.selected_channel_id().unwrap();
+        let person = id.user().unwrap();
+        let message_id = MessageId::new(id, 0);
+        let mut message = app.storage.message(message_id).unwrap();
+        message.receipt = Receipt::Sent;
+        app.storage.store_message(id, &message);
+        app.hide_current_channel().unwrap();
+        app.handle_receipt(person, Receipt::Read, vec![0]);
+        assert_eq!(
+            app.storage.message(message_id).unwrap().receipt,
+            Receipt::Read
+        );
+        message.from_id = person;
+        message.receipt = Receipt::Delivered;
+        app.storage.store_message(id, &message);
+        app.modify_channel_by_id(id, |channel| {
+            channel.unread_messages = 1;
+            true
+        });
+        app.handle_read(&[Read {
+            sender_aci: Some(person.to_string()),
+            timestamp: Some(0),
+            ..Default::default()
+        }]);
+        assert_eq!(app.channel(id).unwrap().unread_messages, 0);
+        assert_eq!(app.storage.channel(id).unwrap().unread_messages, 0);
+    }
+
     /// Overwrites the unread counter of the given channel in memory and storage.
     fn set_unread(app: &mut App, channel_id: ChannelId, unread_messages: u32) {
         app.channels
@@ -1118,16 +1313,21 @@ mod tests {
     async fn test_handle_read() {
         let (mut app, _events, _sent_messages) = test_app().await;
 
-        // fixture channel already has "First message" at arrived_at 0
+        // Make the fixture an incoming unread message.
         let channel_id = app.channels().first().unwrap().id;
+        let author = Uuid::new_v4();
+        let mut first = app.storage.message(MessageId::new(channel_id, 0)).unwrap();
+        first.from_id = author;
+        app.storage.store_message(channel_id, &first);
         app.storage.store_message(
             channel_id,
-            &Message::text(app.user_id, 42, "unread message".to_string()),
+            &Message::text(author, 42, "unread message".to_string()),
         );
         set_unread(&mut app, channel_id, 2);
 
         // reading the older message leaves the newer one unread
         app.handle_read(&[Read {
+            sender_aci: Some(author.to_string()),
             timestamp: Some(0),
             ..Default::default()
         }]);
@@ -1135,6 +1335,7 @@ mod tests {
 
         // reading the newer message clears the counter
         app.handle_read(&[Read {
+            sender_aci: Some(author.to_string()),
             timestamp: Some(42),
             ..Default::default()
         }]);
@@ -1145,9 +1346,10 @@ mod tests {
     async fn test_handle_read_only_affects_matching_channel() {
         let (mut app, _events, _sent_messages) = test_app().await;
 
+        let author = Uuid::new_v4();
         let channel_a = app.channels().first().unwrap().id;
         app.storage
-            .store_message(channel_a, &Message::text(app.user_id, 100, "a".to_string()));
+            .store_message(channel_a, &Message::text(author, 100, "a".to_string()));
         set_unread(&mut app, channel_a, 1);
 
         let channel_b = ChannelId::User(Uuid::new_v4());
@@ -1165,11 +1367,88 @@ mod tests {
 
         // a read receipt for channel A's message must not touch channel B
         app.handle_read(&[Read {
+            sender_aci: Some(author.to_string()),
             timestamp: Some(100),
             ..Default::default()
         }]);
         assert_eq!(app.channel(channel_a).unwrap().unread_messages, 0);
         assert_eq!(app.channel(channel_b).unwrap().unread_messages, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_sync_ignores_another_senders_matching_timestamp() {
+        let (mut app, _events, _sent_messages) = test_app().await;
+        let channel = app.channels().first().unwrap().id;
+        let author = Uuid::new_v4();
+        app.storage
+            .store_message(channel, &Message::text(author, 100, "incoming".into()));
+        set_unread(&mut app, channel, 1);
+        app.handle_read(&[Read {
+            sender_aci: Some(Uuid::new_v4().to_string()),
+            timestamp: Some(100),
+            ..Default::default()
+        }]);
+        assert_eq!(app.channel(channel).unwrap().unread_messages, 1);
+        app.handle_read(&[Read {
+            sender_aci: Some(author.to_string()),
+            timestamp: Some(100),
+            ..Default::default()
+        }]);
+        assert_eq!(app.channel(channel).unwrap().unread_messages, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn binary_read_sync_marks_exact_message_despite_sender_clock_order() {
+        let (mut app, _, _) = test_app().await;
+        let channel = app.channels().first().unwrap().id;
+        let author = Uuid::new_v4();
+        app.storage.store_message(
+            channel,
+            &Message::text(author, 9000, "received first".into()),
+        );
+        app.storage.store_message(
+            channel,
+            &Message::text(author, 100, "received second".into()),
+        );
+        set_unread(&mut app, channel, 2);
+        let read = Read {
+            sender_aci_binary: Some(author.as_bytes().to_vec()),
+            timestamp: Some(9000),
+            ..Default::default()
+        };
+        app.handle_read(&[read.clone(), read.clone()]);
+        assert_eq!(app.channel(channel).unwrap().unread_messages, 1);
+        assert_eq!(
+            app.storage
+                .message(MessageId::new(channel, 9000))
+                .unwrap()
+                .receipt,
+            Receipt::Read
+        );
+        assert_ne!(
+            app.storage
+                .message(MessageId::new(channel, 100))
+                .unwrap()
+                .receipt,
+            Receipt::Read
+        );
+        app.handle_read(&[read]);
+        assert_eq!(app.channel(channel).unwrap().unread_messages, 1);
+        for binary in [vec![1], Uuid::new_v4().as_bytes().to_vec()] {
+            app.handle_read(&[Read {
+                sender_aci: Some(author.to_string()),
+                sender_aci_binary: Some(binary),
+                timestamp: Some(100),
+            }]);
+        }
+        assert_eq!(app.channel(channel).unwrap().unread_messages, 1);
+        assert_ne!(
+            app.storage
+                .message(MessageId::new(channel, 100))
+                .unwrap()
+                .receipt,
+            Receipt::Read
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1210,7 +1489,7 @@ mod tests {
             ..Message::new(app.user_id, None, [], 1000, Vec::new())
         };
         assert!(!message.is_empty());
-        let message_id = MessageId::new(channel_id, message.arrived_at);
+        let message_id = MessageId::new(channel_id, message.storage_id());
         app.add_message_to_channel(channel_id, message);
 
         let pointer = AttachmentPointer {

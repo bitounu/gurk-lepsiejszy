@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use anyhow::Context as _;
@@ -16,7 +16,7 @@ use crate::event::Event;
 use crate::input::Input;
 use crate::receipt::ReceiptHandler;
 use crate::signal::SignalManager;
-use crate::storage::{MessageId, Storage};
+use crate::storage::{AliasTarget, Draft, MessageId, Storage};
 use crate::util::StatefulList;
 use crate::{
     app::channel::ChannelPosition,
@@ -26,12 +26,26 @@ use crate::{app::window::MessageWindow, channels::SelectChannel};
 
 use presage::proto::data_message::Sticker;
 
+pub(crate) mod aliases;
 mod channel;
+mod composer;
+mod forward;
+mod hidden;
+mod image_viewer;
 mod input;
+mod mentions;
 mod message;
+mod read_sync;
+pub(crate) mod search;
+mod spelling;
+mod text_copy;
 mod window;
 
 pub struct App {
+    pub(crate) spelling: crate::spellcheck::Spellchecker,
+    pub(crate) spelling_dialog: Option<spelling::SpellingDialog>,
+    pub(crate) message_search: Option<search::MessageSearch>,
+    pub(crate) search_focus: Option<search::SearchFocus>,
     pub config: Config,
     signal_manager: Box<dyn SignalManager>,
     pub storage: Box<dyn Storage>,
@@ -40,21 +54,48 @@ pub struct App {
     /// Additionally used as in-memory cache. All writes to the storage must update the data in this
     /// list.
     pub channels: StatefulList<Channel>,
+    hidden_channels: BTreeSet<ChannelId>,
+    hidden_channel_data: BTreeMap<ChannelId, Channel>,
+    pub(crate) text_selection: Option<crate::ui::text_selection::TextSelection>,
+    pub(crate) forward_dialog: Option<forward::ForwardDialog>,
+    forward_generation: u64,
+    read_sync: read_sync::ReadSyncQueue,
+    pub(crate) hidden_dialog: Option<hidden::HiddenDialog>,
+    pub(crate) shortcut_bar_visible: bool,
     pub(crate) positions: BTreeMap<ChannelId, ChannelPosition>,
     pub(crate) window: Option<MessageWindow>,
     pub help_scroll: (u16, u16),
+    pub(crate) help_scroll_max: u16,
+    pub(crate) image_previews: crate::ui::image_preview::PreviewCache,
+    pub(crate) image_viewer: Option<crate::ui::image_viewer::ImageViewer>,
+    pub(crate) image_picker: ratatui_image::picker::Picker,
     pub user_id: Uuid,
+    pub terminal_focused: bool,
     pub should_quit: bool,
     pub should_clear: bool,
     pub open_editor_requested: bool,
+    pub editor_preview_requested: Option<std::path::PathBuf>,
     display_help: bool,
     show_channel_list: bool,
     receipt_handler: ReceiptHandler,
     pub input: Input,
-    drafts: BTreeMap<ChannelId, Input>,
+    pub(crate) mention_completion: Option<mentions::MentionCompletion>,
+    pub(crate) mention_dismissed: Option<(ChannelId, String, usize)>,
+    drafts: BTreeMap<ChannelId, Draft>,
+    saved_drafts: BTreeMap<ChannelId, Draft>,
+    saved_draft_channel: Option<ChannelId>,
+    pub(crate) pending_attachments: Vec<std::path::PathBuf>,
+    pub(crate) composer_error: Option<String>,
+    pub(crate) file_picker_generation: u64,
+    pub(crate) file_picker: Option<crate::ui::file_picker::FilePicker>,
+    pub(crate) send_job: Option<composer::SendJob>,
+    next_send_job: u64,
+    pub(crate) screenshot_in_progress: bool,
     pub is_multiline_input: bool,
     editing: Option<MessageId>,
     pub(crate) select_channel: SelectChannel,
+    pub(crate) local_aliases: BTreeMap<AliasTarget, String>,
+    pub(crate) alias_editor: Option<aliases::AliasEditor>,
     clipboard: Option<arboard::Clipboard>,
     event_tx: mpsc::UnboundedSender<Event>,
     // It is expensive to hit the signal manager contacts storage, so we cache it
@@ -78,16 +119,46 @@ impl App {
     pub fn try_new(
         config: Config,
         signal_manager: Box<dyn SignalManager>,
-        storage: Box<dyn Storage>,
+        mut storage: Box<dyn Storage>,
     ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<Event>)> {
+        storage.set_message_order(config.message_order);
+        let pending_reads = storage
+            .pending_read_sync()
+            .context("failed to load private read sync outbox")?;
+        let mut read_sync = read_sync::ReadSyncQueue::default();
+        for (sender, timestamp) in pending_reads {
+            read_sync.queue(sender, timestamp);
+        }
         let user_id = signal_manager.user_id();
+        let drafts = storage.drafts().context("failed to load message drafts")?;
+        let last_draft_channel = storage
+            .last_draft_channel()
+            .context("failed to load composer context")?;
+        let local_aliases = storage.aliases().context("failed to load local aliases")?;
+
+        let hidden_channels = storage
+            .hidden_channels()
+            .context("failed to load hidden conversations")?;
+        let (hidden, visible): (Vec<_>, Vec<_>) = storage
+            .channels()
+            .into_iter()
+            .partition(|channel| hidden_channels.contains(&channel.id));
+        let hidden_channel_data = hidden
+            .into_iter()
+            .map(|channel| (channel.id, channel))
+            .collect();
 
         // build the list of channels
         let mut channels = StatefulList {
-            items: storage.channels(),
+            items: visible,
             ..Default::default()
         };
         channels.next();
+        if let Some(index) = last_draft_channel
+            .and_then(|id| channels.items.iter().position(|channel| channel.id == id))
+        {
+            channels.state.select(Some(index));
+        }
 
         let clipboard = arboard::Clipboard::new()
             .map_err(|error| warn!(%error, "clipboard disabled"))
@@ -100,7 +171,20 @@ impl App {
 
         let next_expiring_at = storage.next_expiring_at();
 
+        let spelling = crate::spellcheck::Spellchecker::new(&config.spellcheck);
         let mut app = Self {
+            spelling,
+            spelling_dialog: None,
+            message_search: None,
+            search_focus: None,
+            shortcut_bar_visible: config.shortcut_bar.enabled,
+            hidden_channels,
+            hidden_channel_data,
+            text_selection: None,
+            forward_dialog: None,
+            forward_generation: 0,
+            read_sync,
+            hidden_dialog: None,
             config,
             signal_manager,
             user_id,
@@ -109,17 +193,36 @@ impl App {
             positions: Default::default(),
             window: None,
             help_scroll: (0, 0),
+            help_scroll_max: 0,
+            image_previews: Default::default(),
+            image_viewer: None,
+            image_picker: ratatui_image::picker::Picker::halfblocks(),
+            terminal_focused: true,
             should_quit: false,
             should_clear: false,
             open_editor_requested: false,
+            editor_preview_requested: None,
             display_help: false,
             show_channel_list: true,
             receipt_handler: ReceiptHandler::new(),
             input: Default::default(),
-            drafts: BTreeMap::new(),
+            mention_completion: None,
+            mention_dismissed: None,
+            saved_drafts: drafts.clone(),
+            drafts,
+            saved_draft_channel: last_draft_channel,
+            pending_attachments: Vec::new(),
+            composer_error: None,
+            file_picker_generation: 0,
+            file_picker: None,
+            send_job: None,
+            next_send_job: 0,
+            screenshot_in_progress: false,
             is_multiline_input: false,
             editing: None,
             select_channel: Default::default(),
+            local_aliases,
+            alias_editor: None,
             clipboard,
             event_tx,
             names_cache: Default::default(),
@@ -131,6 +234,7 @@ impl App {
             message_view_height: 0,
         };
 
+        app.restore_channel_draft(app.selected_channel_id());
         app.on_channel_changed();
 
         Ok((app, event_rx))
@@ -139,11 +243,7 @@ impl App {
     /// Resolve and cache all user names for the known user channels
     pub async fn populate_names_cache(&self) {
         let mut names_cache = BTreeMap::new();
-        for user_id in self
-            .channels()
-            .iter()
-            .filter_map(|channel| channel.id.user())
-        {
+        for user_id in self.all_channels().filter_map(|channel| channel.id.user()) {
             if let Some(name) = self.resolve_name(user_id).await {
                 names_cache.insert(user_id, name);
             }
@@ -154,36 +254,12 @@ impl App {
     }
 
     pub fn get_input(&mut self) -> &mut Input {
-        if self.select_channel.is_shown {
+        if let Some(editor) = self.alias_editor.as_mut() {
+            &mut editor.input
+        } else if self.select_channel.is_shown {
             &mut self.select_channel.input
         } else {
             &mut self.input
-        }
-    }
-
-    /// Save current input to the old channel's draft and load the new channel's draft.
-    pub fn swap_channel_draft(
-        &mut self,
-        old_channel: Option<ChannelId>,
-        new_channel: Option<ChannelId>,
-    ) {
-        if old_channel == new_channel {
-            return;
-        }
-        // Save current input as old channel's draft
-        if let Some(old_id) = old_channel {
-            let old_input = std::mem::take(&mut self.input);
-            if !old_input.is_empty() {
-                self.drafts.insert(old_id, old_input);
-            } else {
-                self.drafts.remove(&old_id);
-            }
-        }
-        // Restore new channel's draft
-        if let Some(new_id) = new_channel {
-            self.input = self.drafts.remove(&new_id).unwrap_or_default();
-        } else {
-            self.input = Input::default();
         }
     }
 
@@ -207,13 +283,20 @@ impl App {
 
     /// Returns the name of a user by their ID from the cache without resolving it.
     pub fn name_by_id_cached(&self, id: Uuid) -> String {
+        if let Some(alias) = self.local_aliases.get(&AliasTarget::Person(id)) {
+            return alias.clone();
+        }
         if self.user_id == id {
             // it's me
             return self.config.user.display_name.clone();
         };
 
         let cache = self.names_cache.take().unwrap_or_default();
-        let name = cache.get(&id).cloned().unwrap_or_else(|| id.to_string());
+        let name = cache
+            .get(&id)
+            .cloned()
+            .or_else(|| self.storage.name(id))
+            .unwrap_or_else(|| id.to_string());
         self.names_cache.replace(Some(cache));
         name
     }
@@ -281,8 +364,17 @@ impl App {
     }
 
     pub fn channel_name<'a>(&self, channel: &'a Channel) -> Cow<'a, str> {
+        if let Some(alias) = self.local_aliases.get(&AliasTarget::Channel(channel.id)) {
+            return Cow::Owned(alias.clone());
+        }
         if let Some(id) = channel.user_id() {
-            self.name_by_id_cached(id).into()
+            let name = self.name_by_id_cached(id);
+            if !self.local_aliases.contains_key(&AliasTarget::Person(id)) && name == id.to_string()
+            {
+                Cow::Borrowed(&channel.name)
+            } else {
+                Cow::Owned(name)
+            }
         } else {
             (&channel.name).into()
         }
@@ -310,10 +402,50 @@ impl App {
 
     pub fn handle_event(&mut self, event: Event) -> anyhow::Result<()> {
         match event {
+            Event::ForwardPrepared {
+                generation,
+                target,
+                result,
+            } => self.finish_forward(generation, target, result),
+            Event::FilePickerUpdated => {}
+            Event::AttachmentsPrepared { job_id, result } => {
+                self.finish_attachment_send(job_id, result)
+            }
+            Event::ScreenshotCaptured { channel_id, result } => {
+                self.screenshot_in_progress = false;
+                match result {
+                    Ok(Some(path)) => {
+                        if let Err(error) = self.stage_attachment_for(channel_id, path) {
+                            self.composer_error = Some(error.to_string());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => self.composer_error = Some(format!("Screenshot failed: {error}")),
+                }
+            }
+            Event::FileOpened { generation, result } => {
+                if generation == self.file_picker_generation
+                    && let Some(picker) = self.file_picker.as_mut()
+                    && let Err(error) = result
+                {
+                    picker.set_error(format!("Cannot open file: {error:#}"));
+                }
+            }
+            Event::ImageViewerReady => {
+                if self
+                    .image_viewer
+                    .as_ref()
+                    .is_some_and(|viewer| viewer.external_done())
+                {
+                    self.close_image_viewer();
+                } else if let Some(viewer) = self.image_viewer.as_mut() {
+                    self.editor_preview_requested = viewer.take_editor_request();
+                }
+            }
             Event::SentTextResult { message_id, result } => {
                 if let Err(error) = result {
                     let mut message = self.storage.message(message_id).context("no message")?;
-                    message.send_failed = Some(error.to_string());
+                    message.send_failed = Some(format!("{error:#}"));
                     self.store_message(message_id.channel_id, message);
                 }
             }
@@ -461,6 +593,8 @@ pub(crate) mod tests {
                 from_id: signal_manager.user_id(),
                 message: Some("First message".to_string()),
                 arrived_at: 0,
+                local_id: None,
+                is_edit_snapshot: false,
                 quote: Default::default(),
                 attachments: Default::default(),
                 reactions: Default::default(),
@@ -488,6 +622,44 @@ pub(crate) mod tests {
         app.channels.state.select(Some(0));
 
         (app, events, sent_messages)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_alias_precedence_and_original_name_updates() {
+        use crate::storage::AliasTarget;
+        let (mut app, _, _) = test_app().await;
+        let channel_id = app.selected_channel_id().unwrap();
+        let person = channel_id.user().unwrap();
+        app.on_profile_name_resolved(person, "Original Person".into());
+        app.set_local_alias(AliasTarget::Person(person), "  Żółw 🐢  ")
+            .unwrap();
+        assert_eq!(app.name_by_id_cached(person), "Żółw 🐢");
+        assert_eq!(
+            app.channel_name(app.channel(channel_id).unwrap()),
+            "Żółw 🐢"
+        );
+        assert_eq!(app.name_by_id(person).await, "Original Person");
+        app.set_local_alias(AliasTarget::Channel(channel_id), "Praca")
+            .unwrap();
+        assert_eq!(app.channel_name(app.channel(channel_id).unwrap()), "Praca");
+        assert_eq!(app.name_by_id_cached(person), "Żółw 🐢");
+        app.ensure_contact_channel_exists(person, "New Signal Name")
+            .await;
+        assert_eq!(app.channel_name(app.channel(channel_id).unwrap()), "Praca");
+        assert_eq!(
+            app.storage.channel(channel_id).unwrap().name,
+            "New Signal Name"
+        );
+        app.set_local_alias(AliasTarget::Channel(channel_id), "  ")
+            .unwrap();
+        assert_eq!(
+            app.channel_name(app.channel(channel_id).unwrap()),
+            "Żółw 🐢"
+        );
+        app.set_local_alias(AliasTarget::Person(person), "")
+            .unwrap();
+        assert_eq!(app.name_by_id_cached(person), "Original Person");
+        assert!(app.storage.aliases().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -698,7 +870,7 @@ pub(crate) mod tests {
         let at: DateTime<FixedOffset> = at_str.parse().unwrap();
 
         let (cleaned_message, specs) =
-            App::extract_attachments(&message, at, || Some(Ok(clipboard_image.clone())));
+            App::extract_attachments(&message, at, || Some(Ok(clipboard_image.clone())), &[]);
         assert_eq!(cleaned_message, "Hello, World!");
         dbg!(&specs);
 

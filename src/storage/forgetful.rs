@@ -1,13 +1,47 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use uuid::Uuid;
 
 use crate::data::{Channel, ChannelId, Message};
 
-use super::{MessageId, Metadata, Storage};
+use super::{AliasTarget, Draft, MessageId, Metadata, Storage};
 
 /// A storage which actually does not store anything, therefore forgetful.
 pub struct ForgetfulStorage;
 
 impl Storage for ForgetfulStorage {
+    fn hidden_channels(&self) -> anyhow::Result<BTreeSet<ChannelId>> {
+        Ok(BTreeSet::new())
+    }
+
+    fn set_channel_hidden(&mut self, _channel: ChannelId, _hidden: bool) -> anyhow::Result<()> {
+        anyhow::bail!("Hidden conversations require persistent storage")
+    }
+
+    fn drafts(&self) -> anyhow::Result<BTreeMap<ChannelId, Draft>> {
+        Ok(BTreeMap::new())
+    }
+
+    fn store_draft(&mut self, _channel_id: ChannelId, _draft: &Draft) -> anyhow::Result<()> {
+        anyhow::bail!("Composer drafts require persistent storage")
+    }
+
+    fn last_draft_channel(&self) -> anyhow::Result<Option<ChannelId>> {
+        Ok(None)
+    }
+
+    fn store_last_draft_channel(&mut self, _channel_id: Option<ChannelId>) -> anyhow::Result<()> {
+        anyhow::bail!("Composer context requires persistent storage")
+    }
+
+    fn aliases(&self) -> anyhow::Result<BTreeMap<AliasTarget, String>> {
+        Ok(BTreeMap::new())
+    }
+
+    fn set_alias(&mut self, _target: AliasTarget, _alias: Option<&str>) -> anyhow::Result<()> {
+        anyhow::bail!("Local aliases require persistent storage")
+    }
+
     fn channels(&self) -> Vec<Channel> {
         Vec::new()
     }

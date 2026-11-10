@@ -1,7 +1,9 @@
 mod attachment;
+pub(crate) mod attachment_batch;
 mod r#impl;
 mod local_pool;
 mod manager;
+mod send_order;
 pub mod test;
 
 use std::path::Path;
@@ -140,4 +142,31 @@ async fn gen_qr_code(rx: oneshot::Receiver<Url>, path: &Path) -> anyhow::Result<
     println!("{text}");
 
     Ok(())
+}
+
+/// Loads existing local credentials only. Restore must never initiate registration/linking.
+pub async fn backup_account(
+    config: &Config,
+    passphrase: &Passphrase,
+) -> anyhow::Result<crate::backup::cloud::CloudAccount> {
+    anyhow::ensure!(
+        config.signal_db_path().is_file(),
+        "Link gurk to your phone before importing a backup"
+    );
+    let url = Url::from_file_path(config.signal_db_path())
+        .map_err(|_| anyhow!("invalid Signal database path"))?;
+    let store = SqliteStore::open_with_passphrase(
+        url.as_str(),
+        Some(passphrase.as_ref()),
+        OnNewIdentity::Trust,
+    )
+    .await?;
+    let manager = presage::Manager::load_registered(store)
+        .await
+        .context("backup import requires an already linked gurk account")?;
+    Ok(crate::backup::cloud::CloudAccount {
+        aci: manager.registration_data().service_ids.aci,
+        credentials: manager.service_credentials(),
+        servers: manager.registration_data().signal_servers,
+    })
 }

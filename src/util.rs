@@ -182,6 +182,29 @@ pub(crate) static ATTACHMENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new("file:[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>\"\\s{-}\\^⟨⟩`]+").unwrap()
 });
 
+/// Reserve a process-wide timestamp for a new outgoing message. Split attachment
+/// batches must retain distinct identities even when sent within one millisecond.
+pub(crate) fn next_send_timestamp_msec() -> u64 {
+    static LAST_SEND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    reserve_send_timestamp(&LAST_SEND, utc_now_timestamp_msec())
+}
+
+fn reserve_send_timestamp(counter: &std::sync::atomic::AtomicU64, now: u64) -> u64 {
+    use std::sync::atomic::Ordering;
+    let mut previous = counter.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(
+            previous
+                .checked_add(1)
+                .expect("Outgoing timestamp exhausted"),
+        );
+        match counter.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(current) => previous = current,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +212,37 @@ mod tests {
     #[test]
     fn test_is_phone_number() {
         assert!(is_phone_number("+1 800-000-0000"));
+    }
+}
+
+#[cfg(test)]
+mod send_timestamp_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn reservation_handles_same_clock_rollback_and_forward_gap() {
+        let counter = AtomicU64::new(0);
+        assert_eq!(reserve_send_timestamp(&counter, 100), 100);
+        assert_eq!(reserve_send_timestamp(&counter, 100), 101);
+        assert_eq!(reserve_send_timestamp(&counter, 90), 102);
+        assert_eq!(reserve_send_timestamp(&counter, 500), 500);
+        assert_eq!(reserve_send_timestamp(&counter, 500), 501);
+    }
+
+    #[test]
+    fn concurrent_reservations_are_unique() {
+        let counter = AtomicU64::new(0);
+        let mut values = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| reserve_send_timestamp(&counter, 100)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        values.sort_unstable();
+        assert_eq!(values, (100..116).collect::<Vec<_>>());
     }
 }

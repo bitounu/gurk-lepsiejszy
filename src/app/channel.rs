@@ -29,12 +29,23 @@ pub(crate) struct ChannelPosition {
 impl App {
     // Channel API: access from memory + write to storage
 
+    pub(crate) fn all_channels(&self) -> impl Iterator<Item = &Channel> {
+        self.channels
+            .items
+            .iter()
+            .chain(self.hidden_channel_data.values())
+    }
+
     pub(crate) fn channels(&self) -> &[Channel] {
         &self.channels.items
     }
 
     pub(crate) fn channel(&self, channel_id: ChannelId) -> Option<&Channel> {
-        self.channels.items.iter().find(|c| c.id == channel_id)
+        self.channels
+            .items
+            .iter()
+            .find(|c| c.id == channel_id)
+            .or_else(|| self.hidden_channel_data.get(&channel_id))
     }
 
     pub(crate) fn selected_channel(&self) -> Option<&Channel> {
@@ -47,7 +58,11 @@ impl App {
 
     pub(crate) fn store_channel(&mut self, channel: Channel) {
         self.storage.store_channel(&channel);
-        if let Some(old_channel) = self.channels.items.iter_mut().find(|c| c.id == channel.id) {
+        if self.hidden_channels.contains(&channel.id) {
+            self.hidden_channel_data.insert(channel.id, channel);
+        } else if let Some(old_channel) =
+            self.channels.items.iter_mut().find(|c| c.id == channel.id)
+        {
             *old_channel = channel;
         } else {
             self.channels.items.push(channel);
@@ -55,6 +70,7 @@ impl App {
     }
 
     pub(super) fn reset_message_selection(&mut self) {
+        self.search_focus = None;
         if let Some(channel_id) = self.selected_channel_id()
             && let Some(pos) = self.positions.get_mut(&channel_id)
         {
@@ -108,7 +124,7 @@ impl App {
             return;
         };
         let pos = self.positions.entry(window.channel_id()).or_default();
-        let Some(cur) = pos.selected.or(pos.viewport_bottom).or(window.newest()) else {
+        let Some(cur) = pos.selected.or(pos.viewport_bottom) else {
             return;
         };
         match window.newer(cur) {
@@ -119,7 +135,11 @@ impl App {
                     pos.selected = Some(newer);
                 }
             }
-            None => {} // at the newest message
+            None => {
+                self.search_focus = None;
+                pos.selected = None;
+                pos.viewport_bottom = None;
+            } // resume following new messages
         }
     }
 
@@ -156,12 +176,11 @@ impl App {
                 self.ensure_users_are_known(group_data.members.iter().copied().zip(profile_keys))
                     .await;
 
-                self.channels
-                    .modify_channel_by_id(&mut *self.storage, channel_id, |channel| {
-                        channel.name = name;
-                        channel.group_data = Some(group_data);
-                        true
-                    });
+                self.modify_channel_by_id(channel_id, |channel| {
+                    channel.name = name;
+                    channel.group_data = Some(group_data);
+                    true
+                });
             }
             Ok(channel_id)
         } else {
@@ -241,15 +260,14 @@ impl App {
         }
         self.names_cache.replace(Some(cache));
 
-        self.channels
-            .modify_channel_by_id(&mut *self.storage, ChannelId::User(uuid), |channel| {
-                if is_placeholder_name(uuid, &channel.name) {
-                    channel.name = name;
-                    true
-                } else {
-                    false
-                }
-            });
+        self.modify_channel_by_id(ChannelId::User(uuid), |channel| {
+            if is_placeholder_name(uuid, &channel.name) {
+                channel.name = name;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     async fn ensure_users_are_known(
@@ -286,8 +304,7 @@ impl App {
     ) -> ChannelId {
         let channel_id = ChannelId::User(uuid);
         let exists = self
-            .channels
-            .modify_channel_by_id(&mut *self.storage, channel_id, |channel| {
+            .modify_channel_by_id(channel_id, |channel| {
                 if channel.name != name {
                     channel.name = name.to_string();
                     true
@@ -356,11 +373,10 @@ impl App {
 
     pub(crate) fn touch_channel(&mut self, channel_id: ChannelId, from_current_user: bool) {
         if !from_current_user && self.selected_channel_id() != Some(channel_id) {
-            self.channels
-                .modify_channel_by_id(&mut *self.storage, channel_id, |channel| {
-                    channel.unread_messages += 1;
-                    true
-                });
+            self.modify_channel_by_id(channel_id, |channel| {
+                channel.unread_messages += 1;
+                true
+            });
         } else {
             self.reset_unread_messages();
         }
@@ -400,7 +416,12 @@ impl App {
 
     /// Reset dwell tracking when channel selection changes
     pub fn on_channel_changed(&mut self) {
+        self.spelling_dialog = None;
+        self.message_search = None;
+        self.search_focus = None;
         let Some(channel) = self.channels.selected_item() else {
+            self.window = None;
+            self.timers_activated_for = None;
             return;
         };
         let pos = self.positions.entry(channel.id).or_default();
@@ -447,7 +468,7 @@ impl App {
             .messages(channel_id)
             .filter_map(|msg| {
                 if msg.expires_at.is_none() && msg.expire_timer.is_some_and(|t| t > 0) {
-                    Some((msg.arrived_at, msg.expire_timer.unwrap()))
+                    Some((msg.storage_id(), msg.expire_timer.unwrap()))
                 } else {
                     None
                 }

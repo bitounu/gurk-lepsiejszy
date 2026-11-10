@@ -15,13 +15,18 @@ use uuid::Uuid;
 
 use crate::data::{Channel, GroupData, Message};
 use crate::receipt::Receipt;
-use crate::util::utc_now_timestamp_msec;
 
 use super::{Attachment, GroupMasterKeyBytes, ProfileKeyBytes, ResolvedGroup, SignalManager};
+
+type ReadSyncLog = Rc<RefCell<Vec<Vec<(Uuid, u64)>>>>;
+type SentFilesLog = Rc<RefCell<Vec<Vec<(String, Option<String>, Vec<u8>)>>>>;
 
 /// Signal manager mock which does not send any messages.
 pub struct SignalManagerMock {
     user_id: Uuid,
+    pub read_syncs: ReadSyncLog,
+    pub sent_destinations: Rc<RefCell<Vec<crate::data::ChannelId>>>,
+    pub sent_files: SentFilesLog,
     pub sent_messages: Rc<RefCell<Vec<Message>>>,
 }
 
@@ -29,7 +34,10 @@ impl SignalManagerMock {
     pub fn new() -> Self {
         Self {
             user_id: Uuid::nil(),
+            sent_destinations: Default::default(),
+            sent_files: Default::default(),
             sent_messages: Default::default(),
+            read_syncs: Default::default(),
         }
     }
 }
@@ -81,16 +89,30 @@ impl SignalManager for SignalManagerMock {
 
     fn send_receipt(&self, _: Uuid, _: Vec<u64>, _: Receipt) {}
 
+    fn send_read_sync(&self, read: Vec<(Uuid, u64)>) -> oneshot::Receiver<anyhow::Result<()>> {
+        self.read_syncs.borrow_mut().push(read);
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Ok(()));
+        rx
+    }
+
     fn send_text(
         &self,
-        _channel: &Channel,
-        text: String,
+        channel: &Channel,
+        text: crate::mentions::MessageText,
         quote_message: Option<&Message>,
         _edit_message_timestamp: Option<u64>,
-        _attachments: Vec<(AttachmentSpec, Vec<u8>)>,
+        attachments: Vec<(AttachmentSpec, Vec<u8>)>,
     ) -> (Message, oneshot::Receiver<anyhow::Result<()>>) {
-        let message: String = crate::emoji::replace_shortcodes(&text).into_owned();
-        let timestamp = utc_now_timestamp_msec();
+        self.sent_destinations.borrow_mut().push(channel.id);
+        self.sent_files.borrow_mut().push(
+            attachments
+                .into_iter()
+                .map(|(spec, bytes)| (spec.content_type, spec.file_name, bytes))
+                .collect(),
+        );
+        let (message, body_ranges) = text.encode();
+        let timestamp = crate::util::next_send_timestamp_msec();
         let quote = quote_message.map(|message| Quote {
             id: Some(message.arrived_at),
             author_aci: Some(message.from_id.to_string()),
@@ -102,11 +124,13 @@ impl SignalManager for SignalManagerMock {
             from_id: self.user_id(),
             message: Some(message),
             arrived_at: timestamp,
+            local_id: None,
+            is_edit_snapshot: false,
             quote: quote_message,
             attachments: Default::default(),
             reactions: Default::default(),
             receipt: Receipt::Sent,
-            body_ranges: Default::default(),
+            body_ranges,
             send_failed: Default::default(),
             attachment_downloads: Default::default(),
             edit: Default::default(),
@@ -155,7 +179,10 @@ impl SignalManager for SignalManagerMock {
     fn clone_boxed(&self) -> Box<dyn SignalManager> {
         Box::new(Self {
             user_id: self.user_id,
+            sent_destinations: self.sent_destinations.clone(),
+            sent_files: self.sent_files.clone(),
             sent_messages: self.sent_messages.clone(),
+            read_syncs: self.read_syncs.clone(),
         })
     }
 

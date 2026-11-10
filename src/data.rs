@@ -222,6 +222,12 @@ pub struct Message {
     pub from_id: Uuid,
     pub message: Option<String>,
     pub arrived_at: u64,
+    /// Local storage key only; Signal timestamps remain in arrived_at.
+    #[serde(skip)]
+    pub(crate) local_id: Option<u64>,
+    /// Local edit-history snapshot, never a Signal protocol identity.
+    #[serde(skip)]
+    pub(crate) is_edit_snapshot: bool,
     #[serde(default)]
     pub quote: Option<Box<Message>>,
     #[serde(default)]
@@ -347,6 +353,10 @@ impl BodyRange {
 }
 
 impl Message {
+    pub fn storage_id(&self) -> u64 {
+        self.local_id.unwrap_or(self.arrived_at)
+    }
+
     pub(crate) fn new(
         from_id: Uuid,
         message: Option<String>,
@@ -358,6 +368,8 @@ impl Message {
             from_id,
             message,
             arrived_at,
+            local_id: None,
+            is_edit_snapshot: false,
             quote: None,
             attachments,
             reactions: Default::default(),
@@ -378,6 +390,8 @@ impl Message {
             from_id,
             message: Some(message),
             arrived_at,
+            local_id: None,
+            is_edit_snapshot: false,
             quote: Default::default(),
             attachments: Default::default(),
             reactions: Default::default(),
@@ -401,6 +415,8 @@ impl Message {
             )?,
             message: quote.text,
             arrived_at: quote.id?,
+            local_id: None,
+            is_edit_snapshot: false,
             quote: None,
             attachments: Default::default(),
             reactions: Default::default(),
@@ -435,4 +451,22 @@ pub fn parse_uuid(str_field: Option<&str>, binary_field: Option<&[u8]>) -> Optio
         .and_then(ServiceId::parse_from_service_id_binary)
         .map(|sid| sid.raw_uuid())
         .or_else(|| str_field.and_then(|s| s.parse().ok()))
+}
+
+#[cfg(test)]
+mod local_identity_tests {
+    use super::*;
+    #[test]
+    fn local_ids_do_not_change_legacy_staging_wire_representation() {
+        let mut message = Message::text(Uuid::nil(), 17, "history".into());
+        let old = postcard::to_allocvec(&message).unwrap();
+        message.local_id = Some(i64::MAX as u64);
+        message.is_edit_snapshot = true;
+        assert_eq!(old, postcard::to_allocvec(&message).unwrap());
+        let restored: Message = postcard::from_bytes(&old).unwrap();
+        assert_eq!(restored.arrived_at, 17);
+        assert_eq!(restored.storage_id(), 17);
+        assert_eq!(restored.local_id, None);
+        assert!(!restored.is_edit_snapshot);
+    }
 }

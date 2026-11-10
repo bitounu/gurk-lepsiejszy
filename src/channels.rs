@@ -21,14 +21,10 @@ pub(crate) struct ItemData {
 }
 
 impl SelectChannel {
-    pub fn reset(&mut self, storage: &dyn Storage) {
+    pub fn reset(&mut self, storage: &dyn Storage, items: Vec<ItemData>) {
         self.input.take();
         self.state = Default::default();
 
-        let items = storage.channels().into_iter().map(|channel| ItemData {
-            channel_id: channel.id,
-            name: channel.name.clone(),
-        });
         self.items.clear();
         self.items.extend(items);
 

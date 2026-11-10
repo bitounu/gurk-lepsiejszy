@@ -152,6 +152,26 @@ pub enum WindowMode {
 )]
 #[strum(serialize_all = "snake_case")]
 pub enum Command {
+    #[strum(props(desc = "Check composer spelling; choose a correction or ignore a word"))]
+    CheckSpelling,
+    #[strum(props(desc = "Search message text in the active conversation"))]
+    SearchMessages,
+    #[strum(props(desc = "Jump to the oldest message in the active conversation"))]
+    JumpOldest,
+    #[strum(props(desc = "Jump to the newest message and resume following"))]
+    JumpNewest,
+    #[strum(props(
+        desc = "Select message text with keyboard (Space selects, Enter copies, Esc cancels)"
+    ))]
+    SelectText,
+    #[strum(props(desc = "Forward selected message without source attribution"))]
+    ForwardMessage,
+    #[strum(props(desc = "Toggle contextual bottom shortcut bar"))]
+    ToggleShortcutBar,
+    #[strum(props(desc = "Hide and locally silence current conversation"))]
+    HideChannel,
+    #[strum(props(desc = "Restore hidden conversations"))]
+    ShowHiddenChannels,
     #[strum(props(desc = "Do nothing"))]
     NoOp,
     #[strum(props(desc = "Toggle help panel"))]
@@ -225,8 +245,20 @@ pub enum Command {
     OpenUrl,
     #[strum(props(desc = "Try to open the first file attachment of the selected message"))]
     OpenFile,
+    #[strum(props(
+        desc = "View selected message image fullscreen or in configured external program"
+    ))]
+    ViewImage,
+    #[strum(props(desc = "Choose a file to attach (Enter confirms send, Esc removes attachment)"))]
+    AttachFiles,
+    #[strum(props(desc = "Capture screenshot, save it and stage it as an unsent attachment"))]
+    CaptureScreenshot,
     #[strum(props(desc = "Toggle mute for the selected channel"))]
     ToggleMuteChannel,
+    #[strum(props(desc = "Edit local alias of the current channel (empty removes it)"))]
+    EditChannelAlias,
+    #[strum(props(desc = "Edit local alias of the selected author or direct-message contact"))]
+    EditPersonAlias,
     #[strum(props(desc = "Toggle channel list pane visibility"))]
     ToggleChannelList,
     // ReplyMessage,
@@ -461,10 +493,25 @@ fn parse(input: &str) -> Result<Command, CommandParseError> {
 const DEFAULT_KEYBINDINGS: &str = r#"
 [anywhere]
 F1 = "help"
+F4 = "toggle_shortcut_bar"
 ctrl-c = "quit"
 ctrl-l = "redraw"
 
 [normal]
+"/" = "search_messages"
+F8 = "search_messages"
+F9 = "check_spelling"
+ctrl-home = "jump_oldest"
+ctrl-end = "jump_newest"
+F2 = "edit_channel_alias"
+F3 = "edit_person_alias"
+F6 = "hide_channel"
+F7 = "show_hidden_channels"
+alt-p = "view_image"
+alt-a = "attach_files"
+alt-s = "capture_screenshot"
+alt-v = "select_text"
+alt-r = "forward_message"
 ctrl-p = "toggle_channel_modal"
 alt-enter = "toggle_multiline"
 ctrl-left = "move_text previous character"
@@ -502,6 +549,8 @@ alt-l = "toggle_channel_list"
 ctrl-o = "open_editor"
 
 [message_selected]
+e = "edit_message"
+alt-r = "forward_message"
 alt-y = "copy_message selected"
 ctrl-e = "edit_message"
 ctrl-d = "delete_message"
@@ -605,6 +654,52 @@ mod tests {
     #[test]
     fn default_keybindings_parse() {
         get_keybindings(&ModeKeybindingConfig::new(), true).unwrap();
+    }
+
+    #[test]
+    fn search_and_boundary_bindings_preserve_existing_defaults() {
+        use super::{Command, WindowMode};
+        let bindings = get_keybindings(&ModeKeybindingConfig::new(), true).unwrap();
+        let normal = &bindings[&WindowMode::Normal];
+        for (key, command) in [
+            ("/", Command::SearchMessages),
+            ("F8", Command::SearchMessages),
+            ("ctrl-home", Command::JumpOldest),
+            ("ctrl-end", Command::JumpNewest),
+            ("F3", Command::EditPersonAlias),
+            ("home", Command::BeginningOfLine),
+            ("end", Command::EndOfLine),
+        ] {
+            assert_eq!(normal.get(&key.parse().unwrap()), Some(&command));
+        }
+    }
+
+    #[test]
+    fn search_and_boundary_commands_can_be_remapped_or_removed() {
+        use super::{Command, WindowMode};
+        let config = toml::from_str(
+            r#"[normal]
+"/" = ""
+F8 = "attach_files"
+ctrl-f = "search_messages"
+ctrl-up = "jump_oldest"
+ctrl-down = "jump_newest"
+"#,
+        )
+        .unwrap();
+        for defaults in [false, true] {
+            let bindings = get_keybindings(&config, defaults).unwrap();
+            let normal = &bindings[&WindowMode::Normal];
+            assert!(!normal.contains_key(&"/".parse().unwrap()));
+            for (key, command) in [
+                ("F8", Command::AttachFiles),
+                ("ctrl-f", Command::SearchMessages),
+                ("ctrl-up", Command::JumpOldest),
+                ("ctrl-down", Command::JumpNewest),
+            ] {
+                assert_eq!(normal.get(&key.parse().unwrap()), Some(&command));
+            }
+        }
     }
 
     #[test]
