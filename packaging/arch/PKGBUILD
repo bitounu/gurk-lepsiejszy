@@ -7,7 +7,8 @@ arch=('x86_64')
 url='https://github.com/boxdot/gurk-rs'
 license=('AGPL-3.0-only')
 depends=('glibc>=2.39' 'libgcc' 'libstdc++')
-makedepends=('cargo>=1.94' 'protobuf' 'clang' 'cmake' 'pkgconf' 'git')
+# Arch provides cargo without a version; Cargo.toml enforces the minimum Rust version.
+makedepends=('cargo' 'protobuf' 'clang' 'cmake' 'pkgconf' 'git')
 optdepends=('hunspell-pl: Polish offline spelling dictionary' 'hunspell-en_us: English offline spelling dictionary' 'xdg-utils: open links and attachments' 'sxiv: optional external image viewer' 'ttf-nerd-fonts-symbols-mono: file type icons' 'xdg-desktop-portal: interactive screenshot capture' 'grim: Wayland screenshot fallback' 'maim: interactive X11 screenshot fallback' 'scrot: alternative X11 screenshot fallback')
 provides=('gurk=0.10.2')
 conflicts=('gurk' 'gurk-git' 'gurk-bin')
