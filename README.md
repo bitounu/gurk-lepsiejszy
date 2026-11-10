@@ -40,9 +40,6 @@ library code retain their respective authorship and licenses.
 
 ## About this version
 
-The screenshots below are redacted copies; some are cropped to the relevant
-controls. Example contact names replace private names.
-
 Gurk links to an existing Signal account and provides conversations, groups,
 replies, reactions and attachments in a terminal. This version adds local
 aliases, persistent drafts, file selection, image galleries, search, offline
@@ -55,7 +52,7 @@ bar and ASCII emoticon replacement are disabled by default. See
 
 ![Gurk conversation layout with an inline attachment thumbnail](docs/images/interface.png)
 
-*Conversation layout and inline image preview. Private names and conversation text have been removed.*
+*Conversation layout and inline image preview.*
 
 ## Install and build
 
@@ -133,7 +130,7 @@ an alias reveals the current synchronized name. Editing preserves the draft.
 
 ![Local conversation alias editor](docs/images/local-alias.png)
 
-*Local alias editor with an anonymous example name. Enter saves; Esc cancels.*
+*Local alias editor. Enter saves; Esc cancels.*
 
 ### Drafts
 
@@ -182,7 +179,7 @@ that a recipient received the file.
 
 ![File picker with seven of ten available selection slots used](docs/images/attachment-multiselect.png)
 
-*File picker with 7 files marked out of a maximum of 10, modification dates and human-readable sizes. The home path is anonymized.*
+*File picker with 7 files marked out of a maximum of 10, modification dates and human-readable sizes.*
 
 ### Image previews
 
@@ -200,7 +197,7 @@ accessible through their attachment labels. Labels show filenames by default;
 
 ![Selected message containing two image attachments and their thumbnails](docs/images/attachment-gallery-selection.png)
 
-*A selected message contains two image attachments. Alt+P opens the attachment gallery; private message text is removed.*
+*A selected message contains two image attachments. Alt+P opens the attachment gallery.*
 
 ### Attachment gallery
 
@@ -232,11 +229,11 @@ closable error rather than opening an editor.
 
 ![First image in the internal attachment gallery](docs/images/attachment-gallery-first.png)
 
-*First attachment, shown at 100% in the Kitty renderer. Identifying details in the photograph are covered.*
+*First attachment, shown at 100% in the Kitty renderer.*
 
 ![Second image in the internal attachment gallery](docs/images/attachment-gallery-second.png)
 
-*Right switches to the second attachment; Left returns to the first. The vehicle registration is covered.*
+*Right switches to the second attachment; Left returns to the first.*
 
 <details>
 <summary>Zoom and panning examples</summary>
@@ -298,7 +295,7 @@ provided. Terminal Shift+mouse selection and link handling remain available.
 
 ![Conversation search controls with a highlighted result](docs/images/conversation-search.png)
 
-*Literal search for CCD, showing result 6 of 7. Up/Down changes the result; Enter keeps its position. Sender labels are removed.*
+*Literal search for CCD, showing result 6 of 7. Up/Down changes the result; Enter keeps its position.*
 
 ### Editing sent messages
 
@@ -329,9 +326,9 @@ inside a confirmed name makes it plain text; pasted/typed `@name` is not bound
 automatically. Ambiguous compound external-editor changes may also remove the
 binding. Mention notifications depend on recipients, membership and settings.
 
-![Contact completion popup with anonymous example names](docs/images/contact-mentions.png)
+![Contact completion popup](docs/images/contact-mentions.png)
 
-*Contact completion for @a. Anonymous names replace the original contacts; Tab or Enter inserts the selected mention.*
+*Contact completion for @a. Tab or Enter inserts the selected mention.*
 
 ### ASCII emoticons
 
@@ -437,7 +434,7 @@ configured under `[shortcut_bar]`.
 
 ![Contextual shortcut bar at the bottom of the terminal](docs/images/shortcut-bar.png)
 
-*F4 toggles the contextual shortcut bar. This crop shows the conversation controls.*
+*F4 toggles the contextual shortcut bar. The bar shows the conversation controls.*
 
 ### Conversation and composer
 
