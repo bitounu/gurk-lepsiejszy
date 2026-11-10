@@ -269,7 +269,9 @@ fn draw_select_channel_popup(f: &mut Frame, select_channel: &mut SelectChannel, 
 
 fn draw_channels(f: &mut Frame, app: &mut App, area: Rect) {
     let channel_list_width = area.width.saturating_sub(2) as usize;
-    let channels = app.channels().iter().map(|channel| {
+    let favorite_count = app.favorite_channel_count();
+    let separator = favorite_count > 0 && favorite_count < app.channels().len();
+    let channels = app.channels().iter().enumerate().map(|(index, channel)| {
         let unread_messages_label = if channel.unread_messages != 0 {
             format!(" ({})", channel.unread_messages)
         } else {
@@ -277,7 +279,12 @@ fn draw_channels(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let mute_label = if channel.muted { " [M]" } else { "" };
         let typing_label = if channel.is_writing() { " [T]" } else { "" };
-        let suffix = format!("{unread_messages_label}{mute_label}{typing_label}");
+        let favorite_label = if app.favorite_channels.contains(&channel.id) {
+            " [*]"
+        } else {
+            ""
+        };
+        let suffix = format!("{favorite_label}{unread_messages_label}{mute_label}{typing_label}");
         let channel_name = app.channel_name(channel);
         let label = format!("{channel_name}{suffix}");
         let label_width = label.width();
@@ -295,7 +302,12 @@ fn draw_channels(f: &mut Frame, app: &mut App, area: Rect) {
                 .collect();
             format!("{clipped}{suffix}")
         };
-        ListItem::new(label)
+        // Keep the separator inside the final favorite's height, never as a selectable item.
+        let mut lines = vec![Line::raw(label)];
+        if separator && index + 1 == favorite_count {
+            lines.push(Line::raw(""));
+        }
+        ListItem::new(lines)
     });
 
     let channels = List::new(channels)
@@ -303,6 +315,19 @@ fn draw_channels(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(Style::default().reversed());
     let no_channels = channels.is_empty();
     f.render_stateful_widget(channels, area, &mut app.channels.state);
+    // Overlay the separator so it never inherits the selected item's reverse style.
+    let offset = app.channels.state.offset();
+    if separator && offset < favorite_count && area.width > 2 && area.height > 2 {
+        let row = favorite_count - offset;
+        if row < usize::from(area.height - 2) {
+            let separator_area = Rect::new(area.x + 1, area.y + 1 + row as u16, area.width - 2, 1);
+            f.render_widget(Clear, separator_area);
+            f.render_widget(
+                Paragraph::new("─".repeat(channel_list_width)),
+                separator_area,
+            );
+        }
+    }
 
     if no_channels {
         f.render_widget(
@@ -1559,6 +1584,10 @@ fn quick_help(app: &App) -> Vec<Line<'static>> {
         )),
         Line::raw("Hidden list: Up/Down select | Enter restore | Esc close"),
         Line::raw(format!(
+            "{}: toggle local favorite [*]; favorites stay above the separator",
+            keys(Command::ToggleFavorite)
+        )),
+        Line::raw(format!(
             "{}: forward highlighted message without source attribution",
             keys(Command::ForwardMessage)
         )),
@@ -1695,10 +1724,63 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use crate::data::{AssociatedValue, BodyRange};
+    use crate::data::{AssociatedValue, BodyRange, ChannelId};
     use crate::signal::Attachment;
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn favorites_separator_mouse_scroll_and_bindings() {
+        use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+        let (mut app, _, _) = crate::app::tests::test_app().await;
+        let favorite = app.selected_channel_id().unwrap();
+        app.on_key(KeyCode::F(5).into()).await.unwrap();
+        let mut other = app.channel(favorite).unwrap().clone();
+        other.id = ChannelId::User(Uuid::new_v4());
+        other.name = "Other".into();
+        let regular = other.id;
+        app.store_channel(other);
+        let area = Rect::new(0, 0, 24, 8);
+        let mut terminal = Terminal::new(TestBackend::new(24, 8)).unwrap();
+        terminal.draw(|f| draw_channels(f, &mut app, area)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 2)].symbol(), "─");
+        assert!(!buffer[(1, 2)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buffer[(1, 3)].symbol(), "O");
+        let mouse = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(mouse(2), Rect::new(0, 0, 72, 8));
+        assert_eq!(app.selected_channel_id(), Some(favorite));
+        app.on_mouse(mouse(3), Rect::new(0, 0, 72, 8));
+        assert_eq!(app.selected_channel_id(), Some(regular));
+        app.select_previous_channel();
+        assert_eq!(app.selected_channel_id(), Some(favorite));
+        app.select_next_channel();
+        assert_eq!(app.selected_channel_id(), Some(regular));
+        *app.channels.state.offset_mut() = 1;
+        terminal.draw(|f| draw_channels(f, &mut app, area)).unwrap();
+        assert_eq!(app.channel_index_at_row(0), Some(1));
+        assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "O");
+        let bindings = toml::from_str("[normal]\nF10 = \"toggle_favorite\"\n").unwrap();
+        app.mode_keybindings = crate::command::get_keybindings(&bindings, false).unwrap();
+        app.on_key(KeyCode::F(10).into()).await.unwrap();
+        assert_eq!(app.favorite_channel_count(), 2);
+        *app.channels.state.offset_mut() = 0;
+        terminal.draw(|f| draw_channels(f, &mut app, area)).unwrap();
+        assert_eq!(app.channel_index_at_row(1), Some(1));
+        assert!((1..7).all(|row| terminal.backend().buffer()[(1, row)].symbol() != "─"));
+        app.on_key(KeyCode::F(10).into()).await.unwrap();
+        app.channels.state.select(Some(0));
+        app.toggle_favorite().unwrap();
+        assert_eq!(app.favorite_channel_count(), 0);
+        terminal.draw(|f| draw_channels(f, &mut app, area)).unwrap();
+        assert!((1..7).all(|row| terminal.backend().buffer()[(1, row)].symbol() != "─"));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn local_alias_renders_in_narrow_channel_list_and_editor() {

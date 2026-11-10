@@ -64,6 +64,11 @@ pub trait Storage {
         id.arrived_at
     }
 
+    /// Load local favorites independently of synchronized conversation data.
+    fn favorite_channels(&self) -> anyhow::Result<BTreeSet<ChannelId>>;
+
+    fn set_channel_favorite(&mut self, channel: ChannelId, favorite: bool) -> anyhow::Result<()>;
+
     /// Load local conversation visibility overrides, reporting read or decode failures.
     fn hidden_channels(&self) -> anyhow::Result<BTreeSet<ChannelId>>;
 

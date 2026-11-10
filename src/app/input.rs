@@ -60,7 +60,7 @@ impl App {
                 let col = event.column;
                 let row = event.row;
                 if let Some(channel_idx) = crate::ui::coords_within_channels_view(area, col, row)
-                    .map(|(_, row)| row as usize)
+                    .and_then(|(_, row)| self.channel_index_at_row(row as usize))
                     .filter(|&idx| idx < self.channels.items.len())
                 {
                     let old = self.selected_channel_id();
@@ -99,6 +99,11 @@ impl App {
             Command::ToggleShortcutBar => {
                 self.shortcut_bar_visible = !self.shortcut_bar_visible;
                 self.should_clear = true;
+            }
+            Command::ToggleFavorite => {
+                if let Err(error) = self.toggle_favorite() {
+                    self.composer_error = Some(format!("Cannot update favorite: {error:#}"));
+                }
             }
             Command::HideChannel => {
                 if let Err(error) = self.hide_current_channel() {

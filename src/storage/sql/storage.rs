@@ -434,6 +434,30 @@ impl Storage for SqliteStorage {
         })
     }
 
+    fn favorite_channels(&self) -> anyhow::Result<std::collections::BTreeSet<ChannelId>> {
+        block_async_in_place(async {
+            Ok(
+                sqlx::query_scalar::<_, ChannelId>("SELECT channel_id FROM favorite_channels")
+                    .fetch_all(&self.pool)
+                    .await?
+                    .into_iter()
+                    .collect(),
+            )
+        })
+    }
+
+    fn set_channel_favorite(&mut self, channel: ChannelId, favorite: bool) -> anyhow::Result<()> {
+        let sql = if favorite {
+            "INSERT INTO favorite_channels(channel_id) VALUES (?) ON CONFLICT(channel_id) DO NOTHING"
+        } else {
+            "DELETE FROM favorite_channels WHERE channel_id = ?"
+        };
+        block_async_in_place(async {
+            sqlx::query(sql).bind(&channel).execute(&self.pool).await?;
+            Ok(())
+        })
+    }
+
     fn hidden_channels(&self) -> anyhow::Result<std::collections::BTreeSet<ChannelId>> {
         block_async_in_place(async {
             Ok(
@@ -1600,6 +1624,73 @@ mod tests {
         assert!(storage.set_read_sync_pending(sender, 42, false).is_err());
         assert_eq!(storage.pending_read_sync().unwrap(), [(sender, 42)]);
         assert!(!storage.read_sync_completed(sender, 42).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn favorites_migrate_legacy_history_and_survive_reopen() {
+        let dir = tempdir().unwrap();
+        let url: Url = format!("sqlite://{}", dir.path().join("favorites.sqlite").display())
+            .parse()
+            .unwrap();
+        let pool = SqlitePool::connect_with(
+            url.as_str()
+                .parse::<SqliteConnectOptions>()
+                .unwrap()
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        let mut old = sqlx::migrate!();
+        old.migrations.to_mut().retain(|m| m.version < 14);
+        old.run(&pool).await.unwrap();
+        let mut storage = SqliteStorage {
+            pool,
+            message_order: Default::default(),
+        };
+        let person = ChannelId::User(Uuid::nil());
+        let group = ChannelId::Group([17; 32]);
+        storage.store_channel(&test_channel(person, "Legacy"));
+        storage
+            .store_draft(
+                person,
+                &Draft {
+                    text: "Unsent".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        storage
+            .set_alias(AliasTarget::Channel(person), Some("Alias"))
+            .unwrap();
+        seed_legacy_message(&storage.pool, person, 42, "Saved").await;
+        storage.set_channel_hidden(group, true).unwrap();
+        sqlx::migrate!().run(&storage.pool).await.unwrap();
+        assert!(storage.favorite_channels().unwrap().is_empty());
+        for id in [person, group, person] {
+            storage.set_channel_favorite(id, true).unwrap();
+        }
+        storage.pool.close().await;
+        let mut storage = SqliteStorage::open_unencrypted(&url).await.unwrap();
+        assert_eq!(storage.favorite_channels().unwrap(), [person, group].into());
+        assert_eq!(storage.channel(person).unwrap().name, "Legacy");
+        assert_eq!(storage.drafts().unwrap()[&person].text, "Unsent");
+        assert_eq!(
+            storage.aliases().unwrap()[&AliasTarget::Channel(person)],
+            "Alias"
+        );
+        assert!(storage.message(MessageId::new(person, 42)).is_some());
+        assert!(storage.hidden_channels().unwrap().contains(&group));
+        storage.set_channel_favorite(person, false).unwrap();
+        storage.set_channel_favorite(person, false).unwrap();
+        storage.pool.close().await;
+        let mut storage = SqliteStorage::open_unencrypted(&url).await.unwrap();
+        assert_eq!(storage.favorite_channels().unwrap(), [group].into());
+        sqlx::query("DROP TABLE favorite_channels")
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+        assert!(storage.favorite_channels().is_err());
+        assert!(storage.set_channel_favorite(person, true).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -27,6 +27,67 @@ pub(crate) struct ChannelPosition {
 }
 
 impl App {
+    pub fn toggle_favorite(&mut self) -> anyhow::Result<()> {
+        let Some(id) = self.selected_channel_id() else {
+            return Ok(());
+        };
+        let favorite = !self.favorite_channels.contains(&id);
+        // Persist first: errors must leave the flag, active draft and selection intact.
+        self.storage.set_channel_favorite(id, favorite)?;
+        if favorite {
+            self.favorite_channels.insert(id);
+        } else {
+            self.favorite_channels.remove(&id);
+        }
+        self.sort_favorite_channels();
+        self.select_channel = Default::default();
+        Ok(())
+    }
+
+    pub(crate) fn favorite_channel_count(&self) -> usize {
+        self.channels()
+            .iter()
+            .take_while(|channel| self.favorite_channels.contains(&channel.id))
+            .count()
+    }
+
+    pub(crate) fn channel_index_at_row(&self, mut row: usize) -> Option<usize> {
+        let count = self.favorite_channel_count();
+        let separator = count > 0 && count < self.channels().len();
+        for index in self.channels.state.offset()..self.channels().len() {
+            if row == 0 {
+                return Some(index);
+            }
+            row -= 1;
+            if separator && index + 1 == count {
+                if row == 0 {
+                    return None;
+                }
+                row -= 1;
+            }
+        }
+        None
+    }
+
+    pub(super) fn sort_favorite_channels(&mut self) {
+        let selected = self.selected_channel_id();
+        let activity: std::collections::BTreeMap<_, _> = self
+            .channel_activity
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (*id, index))
+            .collect();
+        self.channels.items.sort_by_key(|channel| {
+            (
+                !self.favorite_channels.contains(&channel.id),
+                activity.get(&channel.id).copied().unwrap_or(usize::MAX),
+            )
+        });
+        self.channels
+            .state
+            .select(selected.and_then(|id| self.channels.items.iter().position(|c| c.id == id)));
+    }
+
     // Channel API: access from memory + write to storage
 
     pub(crate) fn all_channels(&self) -> impl Iterator<Item = &Channel> {
@@ -57,6 +118,9 @@ impl App {
     }
 
     pub(crate) fn store_channel(&mut self, channel: Channel) {
+        if !self.channel_activity.contains(&channel.id) {
+            self.channel_activity.push(channel.id);
+        }
         self.storage.store_channel(&channel);
         if self.hidden_channels.contains(&channel.id) {
             self.hidden_channel_data.insert(channel.id, channel);
@@ -66,6 +130,7 @@ impl App {
             *old_channel = channel;
         } else {
             self.channels.items.push(channel);
+            self.sort_favorite_channels();
         }
     }
 
@@ -385,7 +450,19 @@ impl App {
     }
 
     pub(super) fn bubble_up_channel(&mut self, channel_id: ChannelId) {
-        // bubble up channel to the beginning of the list
+        if let Some(index) = self
+            .channel_activity
+            .iter()
+            .position(|id| *id == channel_id)
+        {
+            self.channel_activity[..=index].rotate_right(1);
+        }
+        // Activity only moves a conversation within its favorite/regular section.
+        let first = if self.favorite_channels.contains(&channel_id) {
+            0
+        } else {
+            self.favorite_channel_count()
+        };
         let channels = &mut self.channels;
         let Some(channel_idx) = channels
             .items
@@ -394,12 +471,12 @@ impl App {
         else {
             return;
         };
-        for (prev, next) in (0..channel_idx).zip(1..channel_idx + 1).rev() {
+        for (prev, next) in (first..channel_idx).zip(first + 1..channel_idx + 1).rev() {
             channels.items.swap(prev, next);
         }
         match channels.state.selected() {
-            Some(selected_idx) if selected_idx == channel_idx => channels.state.select(Some(0)),
-            Some(selected_idx) if selected_idx < channel_idx => {
+            Some(selected_idx) if selected_idx == channel_idx => channels.state.select(Some(first)),
+            Some(selected_idx) if first <= selected_idx && selected_idx < channel_idx => {
                 channels.state.select(Some(selected_idx + 1));
             }
             _ => {}

@@ -170,6 +170,10 @@ pub enum Command {
     ToggleShortcutBar,
     #[strum(props(desc = "Hide and locally silence current conversation"))]
     HideChannel,
+    #[strum(props(
+        desc = "Toggle current conversation as a local favorite at the top of the list"
+    ))]
+    ToggleFavorite,
     #[strum(props(desc = "Restore hidden conversations"))]
     ShowHiddenChannels,
     #[strum(props(desc = "Do nothing"))]
@@ -505,6 +509,7 @@ ctrl-home = "jump_oldest"
 ctrl-end = "jump_newest"
 F2 = "edit_channel_alias"
 F3 = "edit_person_alias"
+F5 = "toggle_favorite"
 F6 = "hide_channel"
 F7 = "show_hidden_channels"
 alt-p = "view_image"

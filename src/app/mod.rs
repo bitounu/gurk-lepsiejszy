@@ -54,6 +54,9 @@ pub struct App {
     /// Additionally used as in-memory cache. All writes to the storage must update the data in this
     /// list.
     pub channels: StatefulList<Channel>,
+    pub(crate) favorite_channels: BTreeSet<ChannelId>,
+    /// Global live activity order, before applying favorites and visibility.
+    channel_activity: Vec<ChannelId>,
     hidden_channels: BTreeSet<ChannelId>,
     hidden_channel_data: BTreeMap<ChannelId, Channel>,
     pub(crate) text_selection: Option<crate::ui::text_selection::TextSelection>,
@@ -136,11 +139,15 @@ impl App {
             .context("failed to load composer context")?;
         let local_aliases = storage.aliases().context("failed to load local aliases")?;
 
+        let favorite_channels = storage
+            .favorite_channels()
+            .context("failed to load favorite conversations")?;
         let hidden_channels = storage
             .hidden_channels()
             .context("failed to load hidden conversations")?;
-        let (hidden, visible): (Vec<_>, Vec<_>) = storage
-            .channels()
+        let stored_channels = storage.channels();
+        let channel_activity = stored_channels.iter().map(|channel| channel.id).collect();
+        let (hidden, visible): (Vec<_>, Vec<_>) = stored_channels
             .into_iter()
             .partition(|channel| hidden_channels.contains(&channel.id));
         let hidden_channel_data = hidden
@@ -153,6 +160,9 @@ impl App {
             items: visible,
             ..Default::default()
         };
+        channels
+            .items
+            .sort_by_key(|channel| !favorite_channels.contains(&channel.id));
         channels.next();
         if let Some(index) = last_draft_channel
             .and_then(|id| channels.items.iter().position(|channel| channel.id == id))
@@ -178,6 +188,8 @@ impl App {
             message_search: None,
             search_focus: None,
             shortcut_bar_visible: config.shortcut_bar.enabled,
+            favorite_channels,
+            channel_activity,
             hidden_channels,
             hidden_channel_data,
             text_selection: None,
@@ -622,6 +634,97 @@ pub(crate) mod tests {
         app.channels.state.select(Some(0));
 
         (app, events, sent_messages)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn favorites_preserve_live_activity_when_toggling_and_restoring() {
+        let (mut app, _, _) = test_app().await;
+        let first = app.selected_channel_id().unwrap();
+        let template = app.channel(first).unwrap().clone();
+        let mut ids = vec![first];
+        for n in 1..=3 {
+            let mut channel = template.clone();
+            channel.id = ChannelId::Group([n; 32]);
+            ids.push(channel.id);
+            app.store_channel(channel);
+        }
+        let second = ids[1];
+        let third = ids[2];
+        let fourth = ids[3];
+        // Reactions also bubble channels, without changing stored message timestamps.
+        app.bubble_up_channel(second);
+        app.bubble_up_channel(third);
+        let select = |app: &mut App, id| {
+            let index = app.channels().iter().position(|c| c.id == id).unwrap();
+            app.channels.state.select(Some(index));
+        };
+        select(&mut app, fourth);
+        app.toggle_favorite().unwrap();
+        assert_eq!(
+            app.channels().iter().map(|c| c.id).collect::<Vec<_>>(),
+            [fourth, third, second, first]
+        );
+        app.toggle_favorite().unwrap();
+        assert_eq!(
+            app.channels().iter().map(|c| c.id).collect::<Vec<_>>(),
+            [third, second, first, fourth]
+        );
+        select(&mut app, second);
+        app.toggle_favorite().unwrap();
+        select(&mut app, third);
+        app.toggle_favorite().unwrap();
+        app.bubble_up_channel(second);
+        app.bubble_up_channel(fourth);
+        assert_eq!(
+            app.channels().iter().map(|c| c.id).collect::<Vec<_>>(),
+            [second, third, fourth, first]
+        );
+        assert_eq!(app.selected_channel_id(), Some(third));
+        app.hide_current_channel().unwrap();
+        app.open_hidden_channels();
+        app.on_hidden_channels_key(crossterm::event::KeyCode::Enter.into())
+            .unwrap();
+        assert_eq!(
+            app.channels().iter().map(|c| c.id).collect::<Vec<_>>(),
+            [second, third, fourth, first]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn favorites_keep_activity_groups_selection_drafts_and_hidden_state() {
+        let (mut app, _, _) = test_app().await;
+        let first = app.selected_channel_id().unwrap();
+        let mut channel = app.channel(first).unwrap().clone();
+        channel.id = ChannelId::Group([44; 32]);
+        let second = channel.id;
+        app.store_channel(channel);
+        app.channels.state.select(Some(1));
+        app.input.put_char('x');
+        app.toggle_favorite().unwrap();
+        assert_eq!(app.channels()[0].id, second);
+        assert_eq!(app.selected_channel_id(), Some(second));
+        assert_eq!(app.input.data, "x");
+        assert!(app.storage.favorite_channels().unwrap().contains(&second));
+        app.bubble_up_channel(first);
+        assert_eq!(app.channels()[0].id, second);
+        assert_eq!(app.channel_index_at_row(0), Some(0));
+        assert_eq!(app.channel_index_at_row(1), None);
+        assert_eq!(app.channel_index_at_row(2), Some(1));
+        app.hide_current_channel().unwrap();
+        assert_eq!(app.channels()[0].id, first);
+        assert!(app.storage.favorite_channels().unwrap().contains(&second));
+        let (mut app, _) = App::try_new(app.config, app.signal_manager, app.storage).unwrap();
+        assert_eq!(app.channels()[0].id, first);
+        app.open_hidden_channels();
+        app.on_hidden_channels_key(crossterm::event::KeyCode::Enter.into())
+            .unwrap();
+        assert_eq!(app.channels()[0].id, second);
+        assert_eq!(app.selected_channel_id(), Some(second));
+        assert_eq!(app.input.data, "x");
+        app.toggle_favorite().unwrap();
+        assert!(app.storage.favorite_channels().unwrap().is_empty());
+        assert_eq!(app.selected_channel_id(), Some(second));
+        assert_eq!(app.channel_index_at_row(1), Some(1));
     }
 
     #[tokio::test(flavor = "multi_thread")]

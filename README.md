@@ -22,6 +22,7 @@ library code retain their respective authorship and licenses.
   - [Attachments and screenshots](#attachments-and-screenshots)
   - [Image previews](#image-previews)
   - [Attachment gallery](#attachment-gallery)
+  - [Favorite conversations](#favorite-conversations)
   - [Hidden conversations](#hidden-conversations)
   - [Message order](#message-order)
   - [Search and text selection](#search-and-text-selection)
@@ -248,6 +249,20 @@ closable error rather than opening an editor.
 
 </details>
 
+### Favorite conversations
+
+**F5** toggles the active contact or group as a local favorite. Favorites have a
+`[*]` marker and stay at the top of the conversation pane. A horizontal line
+separates them from other conversations when both sections are present. Each
+section keeps its usual most-recent-activity order; new messages in other
+conversations do not displace favorites. The separator cannot be selected.
+
+Favorites survive restarts and alias/name changes. Hiding a favorite still hides
+and silences it; restoring it returns it to the favorites section. Toggling does
+not change the active conversation, draft or message selection. Existing databases
+start with no favorites. Rebind `toggle_favorite` under `[keybindings.normal]`
+in `gurk.toml` if needed; this setting is local and is not sent to Signal.
+
 ### Hidden conversations
 
 **F6** hides and silences the current conversation locally. It disappears from
@@ -447,6 +462,7 @@ configured under `[shortcut_bar]`.
 | PgUp, Alt+Up, Alt+K / PgDown, Alt+Down, Alt+J | Previous / next message; past newest clears reply selection |
 | Ctrl+Home / Ctrl+End | Oldest / newest message and follow |
 | F2 / F3 | Conversation alias / person alias |
+| F5 | Toggle active conversation as a favorite |
 | F6 / F7 / Alt+M | Hide / restore list / toggle channel mute |
 | Alt+A / Alt+S / Alt+P | Attach files / screenshot / attachment gallery |
 | / with empty draft, F8 | Search current conversation |
@@ -579,7 +595,7 @@ e = "edit_message"
 Commands include `attach_files`, `capture_screenshot`, `view_image`,
 `search_messages`, `jump_oldest`, `jump_newest`, `select_text`, `forward_message`,
 `check_spelling`, `edit_channel_alias`, `edit_person_alias`, `hide_channel`,
-`show_hidden_channels` and `toggle_shortcut_bar`. Existing navigation/editing
+`show_hidden_channels`, `toggle_favorite` and `toggle_shortcut_bar`. Existing navigation/editing
 commands remain available; see [src/command.rs](src/command.rs) for the complete
 command grammar and default mode bindings.
 

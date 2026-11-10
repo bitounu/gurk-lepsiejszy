@@ -121,6 +121,7 @@ impl App {
                 .state
                 .select(Some(self.channels.items.len() - 1));
         }
+        self.sort_favorite_channels();
         self.swap_channel_draft(old, self.selected_channel_id());
         self.on_channel_changed();
         let entries = self.hidden_entries();

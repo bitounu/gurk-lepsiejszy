@@ -172,6 +172,7 @@ pub(crate) fn items(app: &crate::app::App) -> Vec<(String, String)> {
                 entries.push((Command::ForwardMessage, "forward"));
             }
             entries.extend([
+                (Command::ToggleFavorite, "favorite"),
                 (Command::HideChannel, "hide"),
                 (Command::ShowHiddenChannels, "restore"),
             ]);

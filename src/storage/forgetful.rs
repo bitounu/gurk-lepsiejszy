@@ -10,6 +10,14 @@ use super::{AliasTarget, Draft, MessageId, Metadata, Storage};
 pub struct ForgetfulStorage;
 
 impl Storage for ForgetfulStorage {
+    fn favorite_channels(&self) -> anyhow::Result<BTreeSet<ChannelId>> {
+        Ok(BTreeSet::new())
+    }
+
+    fn set_channel_favorite(&mut self, _channel: ChannelId, _favorite: bool) -> anyhow::Result<()> {
+        anyhow::bail!("Favorite conversations require persistent storage")
+    }
+
     fn hidden_channels(&self) -> anyhow::Result<BTreeSet<ChannelId>> {
         Ok(BTreeSet::new())
     }
