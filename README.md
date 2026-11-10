@@ -36,7 +36,6 @@ library code retain their respective authorship and licenses.
 - [Configuration](#configuration)
 - [Secure Backup restore](#secure-backup-restore)
 - [Troubleshooting and limits](#troubleshooting-and-limits)
-- [Development documentation](#development-documentation)
 - [Credits, license and contact](#credits-license-and-contact)
 
 ## About this version
@@ -50,10 +49,6 @@ Existing configuration files remain readable. Database migrations run
 on startup. Some visible additions are opt-in: inline image previews, the shortcut
 bar and ASCII emoticon replacement are disabled by default. See
 [configuration defaults](#defaults).
-
-The [original interface screenshot](screenshot.png) belongs to upstream gurk.
-It does not illustrate all extensions. The [screenshot plan](docs/SCREENSHOT_PLAN.md)
-lists the new illustrations still needed, using synthetic conversations only.
 
 ## Install and build
 
@@ -644,14 +639,6 @@ RUST_LOG=gurk=info,libsignal_service=warn,presage=warn gurk --verbose
 by `message_timestamp`. Successful submission is not a delivery receipt. Upload
 records exclude message bodies, attachment bytes, keys and CDN URLs; other log
 records can contain filenames. Broader tracing can include sensitive details.
-
-## Development documentation
-
-- [Reconstructed development history](docs/DEVELOPMENT_HISTORY.md) and
-  [commit series with conversation dates](docs/COMMIT_SERIES.md).
-- [Screenshot recommendations and capture plan](docs/SCREENSHOT_PLAN.md).
-- [License review and remaining distribution checks](docs/LICENSE_REVIEW.md).
-- [Designs and implementation notes](docs/superpowers/).
 
 ## Credits, license and contact
 
