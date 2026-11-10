@@ -16,3 +16,14 @@ AGENTS.md
 .aider*
 .copilot/
 audit.md
+
+# Local release packages
+/dist/
+
+# Private review artifacts and generated local data
+*.log
+/gurk-screenshot-*.png
+/screenshot-*.png
+/rozmowa-*.png
+/metadata/
+/backup-import/
