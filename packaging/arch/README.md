@@ -1,57 +1,37 @@
-# Local Arch Linux test package
+# Local Arch package
 
-This PKGBUILD packages the current checkout, including uncommitted changes.
-It is intended for local testing, not submission to the AUR.
-
-On Arch Linux, build from this directory with:
+This recipe packages the current checkout, including uncommitted changes. It is
+for local testing, not an AUR submission. From this directory, as a regular user
+with `base-devel` installed:
 
 ```sh
-makepkg -s
-sudo pacman -U ./gurk-local-aliases-0.10.2.aliases15-1-x86_64.pkg.tar.zst
+makepkg -si
 ```
 
-The package installs `/usr/bin/gurk` and documentation. It provides `gurk`
-and conflicts with `gurk`, `gurk-git` and `gurk-bin`, so pacman can replace an
-existing installation. User configuration, databases and linked device data
-are not included in the package and are not overwritten by installation.
+The `gurk-local-aliases` package installs `/usr/bin/gurk` and the project README
+and license. It provides `gurk` and conflicts with `gurk`, `gurk-git` and
+`gurk-bin`, allowing pacman to replace an existing installation. Configuration,
+databases, registration and private attachments are not part of the package.
 
-Run `gurk` normally. F2 edits the current channel alias; F3 edits the selected
-message author's alias, or the direct conversation's contact when no message
-is selected. Enter saves, Escape cancels, and an empty alias removes it.
+Before first launch against existing history, close other gurk instances and
+copy the data directory. Database migrations run automatically; older application
+versions may not open the new schema. Reverting can require the saved database
+copy as well as the old executable.
 
-The first launch upgrades the gurk database using additive migrations 007 through 011. For tests
-with an existing account, close the previous gurk instance and copy its data
-directory before the first launch, so it is available if you want to revert
-the application and database together.
+The [main README](../../README.md) covers features, shortcuts, settings, image
+viewers, offline dictionaries, attachment workflows and experimental Secure Backup
+import. Existing configurations stay readable. Inline previews, the shortcut bar
+and ASCII emoticon conversion are opt-in; JPEG/PNG metadata cleaning and spelling
+checks are enabled by default.
 
-To restore the official Arch package after testing:
+To return to Arch's upstream package:
 
 ```sh
 sudo pacman -S gurk
 ```
 
-This build also fixes F1 help scrolling and adds optional inline image previews.
-To enable previews, add `show_image_previews = true` at the top level of
-`gurk.toml` (before any table headers), then restart gurk. Old configurations
-without this setting keep previews disabled. PNG, JPEG, GIF, WebP, BMP and TIFF
-are detected by file contents and fitted to the conversation pane.
-
-Alt+P opens the selected message image fullscreen, independently of inline
-previews. The built-in viewer negotiates Kitty/Sixel/iTerm2 support and falls
-back to Unicode half blocks. Esc/q returns to the conversation. Optional
-`[image_viewer] mode = "external"` with `command = ["sxiv", "-a"]` launches sxiv;
-see the project README for complete TOML examples and shortcut configuration.
-
-This build persists conversation drafts and adds Alt+A file attachments and Alt+S
-screenshots. Both stage attachments first; Enter confirms sending and Escape
-removes pending attachments while preserving text. See the installed README for
-file picker controls, icon fallback and screenshot directory/command settings.
-
-This build adds experimental cloud Signal Secure Backup import. Start with
-`gurk --restore-cloud-backup --backup-dry-run`; the recovery key is entered
-locally without echo. See the installed README for resume, disk space and
-unsupported-record limitations. Existing local aliases are preserved.
-
-Conversation navigation: Ctrl+Home oldest, Ctrl+End newest/follow; / with an
-empty composer or F8 opens Unicode literal search. Up/Down selects occurrences;
-Enter keeps the result and Esc restores the previous view. See README for details.
+That installs original gurk without these extensions; database compatibility must
+still be considered. Public binary distribution also needs the corresponding
+source and applicable third-party notices. This recipe includes the root AGPL
+text but does not assemble all dependency notices; see the
+[license review](../../docs/LICENSE_REVIEW.md).

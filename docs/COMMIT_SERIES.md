@@ -322,3 +322,5 @@ Date (author and committer, UTC): `2026-11-10T06:26:58Z`.
 Actual consolidated/anonymized documentation publication timestamp.
 
 - `README.md`
+
+Subsequent maintenance and documentation commits follow this reconstructed series with their actual creation dates. They do not alter the first extension commit or its recorded provenance.
