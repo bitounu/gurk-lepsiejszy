@@ -443,9 +443,13 @@ activity behavior.
 
 ## Keyboard shortcuts
 
-F1 is the in-app reference. **F4** shows context-sensitive hints, including dialog
-and gallery controls. Its initial visibility and contrast/dark/custom colors are
-configured under `[shortcut_bar]`.
+F1 is the in-app reference. **F4** toggles the shortcut menu. The main menu stays
+at the bottom; selecting a message adds its contextual actions above it, and
+clearing selection hides that upper section. Function keys appear first in
+numeric order (F1, F2, …), using your configured bindings. Each section uses
+aligned columns and wraps independently in narrow terminals. Dialogs and the
+gallery show their own controls instead. Initial visibility and
+contrast/dark/custom colors are configured under `[shortcut_bar]`.
 
 ![Contextual shortcut bar at the bottom of the terminal](docs/images/shortcut-bar.png)
 

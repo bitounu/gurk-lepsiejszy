@@ -36,7 +36,8 @@ impl App {
         {
             return;
         }
-        if self.shortcut_bar_visible && event.row >= area.y + area.height.saturating_sub(1) {
+        let bar_height = crate::ui::shortcut_bar::height(self, area);
+        if bar_height > 0 && event.row >= area.bottom().saturating_sub(bar_height) {
             return;
         }
         if self.is_help() {
@@ -407,7 +408,7 @@ impl App {
             .map(|m| MessageId::new(channel_id, m.storage_id()))
     }
 
-    pub(super) fn selected_message(&self) -> Option<Cow<'_, Message>> {
+    pub(crate) fn selected_message(&self) -> Option<Cow<'_, Message>> {
         let channel_id = self.selected_channel_id()?;
         let pos = self.positions.get(&channel_id)?;
         self.window.as_ref()?.get(pos.selected?).map(Cow::Borrowed)

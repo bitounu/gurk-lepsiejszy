@@ -1,6 +1,6 @@
 # Local test package: build from the checkout containing this PKGBUILD.
 pkgname=gurk-local-aliases
-pkgver=0.10.2.aliases25
+pkgver=0.10.2.aliases26
 pkgrel=1
 pkgdesc='Signal terminal client with local aliases, persistent drafts and staged attachments'
 arch=('x86_64')

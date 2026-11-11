@@ -37,23 +37,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.refresh_mentions();
     app.refresh_spelling();
     let full = f.area();
-    let show_bar = app.shortcut_bar_visible && full.height > 1;
+    let layout = (app.shortcut_bar_visible && full.width > 0 && full.height > 1)
+        .then(|| super::shortcut_bar::BarLayout::new(app, full.width));
+    let bar_height = layout
+        .as_ref()
+        .map_or(0, |layout| layout.height(full.height - 1));
     let area = Rect {
-        height: full.height.saturating_sub(u16::from(show_bar)),
+        height: full.height.saturating_sub(bar_height),
         ..full
     };
-    let shortcuts = if show_bar {
-        super::shortcut_bar::items(app)
-    } else {
-        Vec::new()
-    };
     draw_content(f, app, area);
-    if show_bar {
-        super::shortcut_bar::draw(
+    if let Some(layout) = layout {
+        layout.draw(
             f,
-            Rect::new(full.x, full.bottom() - 1, full.width, 1),
+            Rect::new(full.x, full.bottom() - bar_height, full.width, bar_height),
             &app.config.shortcut_bar,
-            &shortcuts,
         );
     }
 }
@@ -1569,7 +1567,7 @@ fn quick_help(app: &App) -> Vec<Line<'static>> {
     };
     vec![
         Line::raw(format!(
-            "{}: toggle contextual shortcut bar",
+            "{}: toggle shortcuts; main menu below, selected-message actions above",
             keys(Command::ToggleShortcutBar)
         )),
         Line::raw(format!(
