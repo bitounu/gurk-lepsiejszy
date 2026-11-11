@@ -251,8 +251,8 @@ closable error rather than opening an editor.
 
 ### Favorite conversations
 
-**F5** toggles the active contact or group as a local favorite. Favorites have a
-`[*]` marker and stay at the top of the conversation pane. A horizontal line
+**F5** toggles the active contact or group as a local favorite. Favorites stay
+at the top of the conversation pane. A horizontal line
 separates them from other conversations when both sections are present. Each
 section keeps its usual most-recent-activity order; new messages in other
 conversations do not displace favorites. The separator cannot be selected.

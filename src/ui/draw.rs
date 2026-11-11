@@ -279,12 +279,7 @@ fn draw_channels(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let mute_label = if channel.muted { " [M]" } else { "" };
         let typing_label = if channel.is_writing() { " [T]" } else { "" };
-        let favorite_label = if app.favorite_channels.contains(&channel.id) {
-            " [*]"
-        } else {
-            ""
-        };
-        let suffix = format!("{favorite_label}{unread_messages_label}{mute_label}{typing_label}");
+        let suffix = format!("{unread_messages_label}{mute_label}{typing_label}");
         let channel_name = app.channel_name(channel);
         let label = format!("{channel_name}{suffix}");
         let label_width = label.width();
@@ -1584,7 +1579,7 @@ fn quick_help(app: &App) -> Vec<Line<'static>> {
         )),
         Line::raw("Hidden list: Up/Down select | Enter restore | Esc close"),
         Line::raw(format!(
-            "{}: toggle local favorite [*]; favorites stay above the separator",
+            "{}: toggle local favorite; favorites stay above the separator",
             keys(Command::ToggleFavorite)
         )),
         Line::raw(format!(
